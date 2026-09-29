@@ -1,0 +1,17 @@
+{
+  "name": "massage-making",
+  "version": "1.0.0",
+  "description": "WhatsApp Gemini bot with web pairing page",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.18",
+    "express": "^4.19.2",
+    "pino": "^9.3.2"
+  }
+}
