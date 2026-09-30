@@ -17,6 +17,10 @@ const PORT = env.PORT || 3000;
 const GEMINI_API_KEY = env.GEMINI_API_KEY || '';
 const ENV_MODEL = env.GEMINI_MODEL || 'gemini-2.5-flash';
 let GEMINI_MODEL = ENV_MODEL;
+const FALLBACK_MODELS = (env.GEMINI_FALLBACK_MODELS || 'gemini-2.5-flash-lite,gemini-2.0-flash')
+  .split(',')
+  .map((x) => x.trim())
+  .filter(Boolean);
 const PHONE = (env.PHONE_NUMBER || '').replace(/\D/g, '');
 const ADMIN_PASSWORD = env.ADMIN_PASSWORD || '';
 const ENV_GROUPS = env.REPLY_IN_GROUPS === 'true';
@@ -31,6 +35,7 @@ const DATA_DIR = env.DATA_DIR || (fs.existsSync('/data') ? '/data' : '.');
 const AUTH_DIR = env.AUTH_DIR || path.join(DATA_DIR, 'auth');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const SENT_FILE = path.join(DATA_DIR, 'sent.json');
+const AIMEM_FILE = path.join(DATA_DIR, 'aimem.json');
 
 // Advance variables
 const validTz = (z) => {
@@ -46,6 +51,8 @@ let TZ = ENV_TZ;
 const HISTORY_LIMIT = Math.max(2, parseInt(env.HISTORY_LIMIT, 10) || 12);
 const CATCHUP_MIN = Math.max(0, parseInt(env.SCHEDULE_CATCHUP_MIN, 10) || 10);
 const SEND_DELAY_MS = Math.max(1000, parseInt(env.SEND_DELAY_MS, 10) || 3000);
+const MAX_REPLIES_PER_MIN = Math.max(1, parseInt(env.MAX_REPLIES_PER_MIN, 10) || 6); // ek chat ko 1 min me max itne AI reply
+const STARTED_AT = Date.now();
 const MAX_MSG_AGE_SEC = 120; // purane (offline) messages ko reply nahi dena
 
 const numList = (v) =>
@@ -111,27 +118,51 @@ const queues = new Map(); // jid -> Promise (ek chat ke messages ek-ek karke)
 // =====================================================================
 async function callGemini(contents, system) {
   if (!GEMINI_API_KEY) return { ok: false, text: 'GEMINI_API_KEY set nahi hai.' };
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
   const body = { contents };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      log('Gemini error:', JSON.stringify(data).slice(0, 300));
-      return { ok: false, text: 'Abhi jawab nahi de pa raha, thodi der baad try karo.' };
+  // pehle main model, fail ho to fallback models (503/429/404 par)
+  const models = [GEMINI_MODEL, ...FALLBACK_MODELS.filter((m) => m !== GEMINI_MODEL)];
+  let lastErr = '';
+  for (const model of models) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          const parts = data?.candidates?.[0]?.content?.parts || [];
+          const text = parts.map((p) => p.text || '').join('').trim();
+          if (text) {
+            if (model !== GEMINI_MODEL) log(`Gemini: fallback model chala -> ${model}`);
+            return { ok: true, text };
+          }
+          lastErr = 'khali jawab';
+          break; // is model se khali jawab aaya, agla model try karo
+        }
+        lastErr = `${model} ${res.status}`;
+        log('Gemini error:', model, JSON.stringify(data).slice(0, 300));
+        if ((res.status === 503 || res.status === 500 || res.status === 429) && attempt === 1) {
+          await sleep(2500); // thoda ruk ke dobara
+          continue;
+        }
+        break; // 400/401/403/404 ya retry khatam -> agla model
+      } catch (e) {
+        lastErr = e.message;
+        log('Gemini exception:', model, e.message);
+        if (attempt === 1) {
+          await sleep(2000);
+          continue;
+        }
+        break;
+      }
     }
-    const parts = data?.candidates?.[0]?.content?.parts || [];
-    const text = parts.map((p) => p.text || '').join('').trim();
-    return { ok: true, text };
-  } catch (e) {
-    log('Gemini exception:', e.message);
-    return { ok: false, text: 'Network problem hai, thodi der baad try karo.' };
   }
+  log('Gemini: sab models fail:', lastErr);
+  return { ok: false, text: 'Abhi jawab nahi de pa raha, thodi der baad try karo.' };
 }
 
 async function askGemini(jid, userText) {
@@ -251,7 +282,21 @@ function toJid(t) {
   return t.includes('@') ? t : `${t}@s.whatsapp.net`;
 }
 
-async function buildMessage(sch) {
+const aiMem = readJson(AIMEM_FILE, {}); // schedule id -> pichle AI messages (repeat rokne ke liye)
+const saveAiMem = () => writeJson(AIMEM_FILE, aiMem);
+
+// Owner ko apne "Message yourself" chat me alert bhejo
+async function alertOwner(text) {
+  try {
+    const n = jidNum(sock?.user?.id);
+    if (!sock || status !== 'connected' || !n) return;
+    noteSent(await sock.sendMessage(`${n}@s.whatsapp.net`, { text: '🤖 ⚠️ ' + text }));
+  } catch (e) {
+    log('alert error:', e.message);
+  }
+}
+
+async function buildMessage(sch, opts = {}) {
   const d = new Date();
   const fill = (s) =>
     s
@@ -261,12 +306,24 @@ async function buildMessage(sch) {
   const msg = fill(sch.message);
   // "ai:" se shuru ho to Gemini har baar naya message likhega
   if (/^ai:/i.test(msg)) {
+    const base = msg.replace(/^ai:/i, '').trim();
+    const prev = (aiMem[sch.id] || []).slice(-15);
+    const avoid = prev.length
+      ? `\n\nPehle ye messages bhej chuka hoon, inhe ya inse milte-julte repeat MAT karna, bilkul naya likho:\n` +
+        prev.map((x) => `- ${x.replace(/\s+/g, ' ').slice(0, 120)}`).join('\n')
+      : '';
     const r = await callGemini(
-      [{ role: 'user', parts: [{ text: msg.replace(/^ai:/i, '').trim() }] }],
+      [{ role: 'user', parts: [{ text: base + avoid }] }],
       SYSTEM_PROMPT + ' Write only the final WhatsApp message text, nothing else.'
     );
-    if (r.ok && r.text) return r.text;
-    log(`${sch.id}: AI message fail hua, skip`);
+    if (r.ok && r.text) {
+      if (!opts.preview) {
+        aiMem[sch.id] = [...prev, r.text].slice(-20);
+        saveAiMem();
+      }
+      return r.text;
+    }
+    log(`${sch.id}: AI message fail hua`);
     return null;
   }
   return msg;
@@ -293,6 +350,7 @@ async function runSchedule(sch) {
 }
 
 let ticking = false;
+const retryInfo = {}; // key -> { n, at }
 async function tick() {
   if (ticking || status !== 'connected' || !settings.schedulerOn || !SCHEDULES.length) return;
   ticking = true;
@@ -300,6 +358,7 @@ async function tick() {
     const n = nowParts();
     const nowMin = n.hh * 60 + n.mm;
     for (const k of Object.keys(sent)) if (!k.startsWith(n.date)) delete sent[k];
+    for (const k of Object.keys(retryInfo)) if (!k.startsWith(n.date)) delete retryInfo[k];
     for (const sch of SCHEDULES) {
       if (!sch.days.includes(n.day) || settings.disabled.includes(sch.id)) continue;
       for (const t of sch.times) {
@@ -307,9 +366,26 @@ async function tick() {
         if (sent[key]) continue;
         const diff = nowMin - t.min;
         if (diff < 0 || diff > CATCHUP_MIN) continue; // time nahi hua ya bahut late ho gaya
+        const ri = retryInfo[key] || { n: 0, at: 0 };
+        if (Date.now() < ri.at) continue; // retry ka intezaar
         sent[key] = true;
         saveSent();
-        await runSchedule(sch);
+        const ok = await runSchedule(sch);
+        if (!ok) {
+          ri.n += 1;
+          if (ri.n < 3) {
+            // fail hua -> 1 minute baad dobara try (max 3 baar)
+            ri.at = Date.now() + 60000;
+            retryInfo[key] = ri;
+            delete sent[key];
+            saveSent();
+            log(`${sch.id} ${t.label}: fail, ${ri.n}/3 retry 1 min baad`);
+          } else {
+            retryInfo[key] = ri;
+            log(`${sch.id} ${t.label}: 3 baar fail, chhod diya`);
+            await alertOwner(`Schedule ${sch.id} (${t.label}) 3 baar try karke bhi nahi ja paya. Logs check karo ya !test se dekho.`);
+          }
+        }
       }
     }
   } catch (e) {
@@ -336,6 +412,19 @@ const msgAge = (ts) => {
   const t = ts && typeof ts === 'object' && ts.toNumber ? ts.toNumber() : Number(ts);
   return t ? Date.now() / 1000 - t : 0;
 };
+
+const replyTimes = new Map(); // jid -> [timestamps]
+function rateOk(jid) {
+  const now = Date.now();
+  const arr = (replyTimes.get(jid) || []).filter((t) => now - t < 60000);
+  if (arr.length >= MAX_REPLIES_PER_MIN) {
+    replyTimes.set(jid, arr);
+    return false;
+  }
+  arr.push(now);
+  replyTimes.set(jid, arr);
+  return true;
+}
 
 function enqueue(jid, fn) {
   const prev = queues.get(jid) || Promise.resolve();
@@ -448,6 +537,10 @@ async function startSock() {
         if (BLOCKED.includes(num) || BLOCKED.includes(jid)) continue;
         if (ALLOWED.length && !ALLOWED.includes(num) && !ALLOWED.includes(jid)) continue;
         if (!text) continue;
+        if (!rateOk(jid)) {
+          log(`rate limit: ${jid} ko reply skip`);
+          continue;
+        }
 
         enqueue(jid, async () => {
           await s.sendPresenceUpdate('composing', jid).catch(() => {});
@@ -510,13 +603,15 @@ Commands ! ya / se shuru karo.
 !add 06:00 | Good morning | numbers | days
 !del N – chat wala schedule hatao
 !off N / !on N – pause / chalu
-!test N – abhi bhejo
+!test N – abhi bhejo (targets ko jayega)
+!preview N – sirf dekho, bheje bina
 !scheduler on/off – sab schedule
 !targets <n1,n2> | !targets reset
 !tz Asia/Kolkata
 
 *Baaki*
-!send <number> <message>
+!gid – apne groups ki ID dekho
+!send <number ya group-ID> <message>
 !restart – bot restart`;
 
 function fmtSchedules() {
@@ -564,7 +659,8 @@ Time: ${n.date} ${String(n.hh).padStart(2, '0')}:${String(n.mm).padStart(2, '0')
 Auto reply: ${settings.autoReply ? 'ON' : 'OFF'} | Groups: ${REPLY_IN_GROUPS ? 'ON' : 'OFF'}
 Scheduler: ${settings.schedulerOn ? 'ON' : 'OFF'} | Schedules: ${SCHEDULES.length}
 Model: ${GEMINI_MODEL}
-Allowed: ${ALLOWED.length || 'sab'} | Blocked: ${BLOCKED.length}`;
+Allowed: ${ALLOWED.length || 'sab'} | Blocked: ${BLOCKED.length}
+Uptime: ${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m | Data: ${DATA_DIR}${DATA_DIR === '.' ? ' (VOLUME NAHI)' : ' ✅'}`;
     }
 
     case 'reply': {
@@ -680,6 +776,13 @@ Allowed: ${ALLOWED.length || 'sab'} | Blocked: ${BLOCKED.length}`;
       return 'Bhej raha hoon...';
     }
 
+    case 'preview': {
+      const sch = SCHEDULES[parseInt(arg, 10) - 1];
+      if (!sch) return 'Use: !preview N (N = !schedules wala number)';
+      const t = await buildMessage(sch, { preview: true });
+      return t ? `Preview (bheja nahi gaya):\n\n${t}\n\nTo: ${sch.targets.join(', ') || '-'}` : 'AI message nahi ban paya, thodi der baad try karo.';
+    }
+
     case 'send': {
       const mm = arg.match(/^(\S+)\s+([\s\S]+)$/);
       if (!mm) return 'Use: !send 919876543210 Hello';
@@ -688,6 +791,14 @@ Allowed: ${ALLOWED.length || 'sab'} | Blocked: ${BLOCKED.length}`;
       if (!sock || status !== 'connected') return 'WhatsApp connected nahi hai.';
       noteSent(await sock.sendMessage(toJid(t), { text: mm[2] }));
       return `Bhej diya → ${t}`;
+    }
+
+    case 'gid':
+    case 'groupids': {
+      if (!sock || status !== 'connected') return 'WhatsApp connected nahi hai.';
+      const g = Object.values(await sock.groupFetchAllParticipating());
+      if (!g.length) return 'Koi group nahi mila. Bot ka number kisi group me member hona chahiye.';
+      return 'Groups (ID copy karke schedule me daalo):\n\n' + g.map((x, i) => `${i + 1}) ${x.subject}\n${x.id}`).join('\n\n');
     }
 
     case 'restart':
@@ -812,5 +923,6 @@ process.on('unhandledRejection', (e) => log('unhandledRejection:', e?.message ||
 process.on('uncaughtException', (e) => log('uncaughtException:', e?.message || e));
 
 applySettings();
+log(`Data folder: ${DATA_DIR} ${DATA_DIR === '.' ? '(VOLUME NAHI LAGA - redeploy par session ud jayega)' : '(volume OK)'} | Model: ${GEMINI_MODEL}`);
 log(`Timezone: ${TZ} | Schedules loaded: ${SCHEDULES.length} | Auto reply: ${settings.autoReply}`);
 startSock().catch((e) => log('start error:', e.message));
