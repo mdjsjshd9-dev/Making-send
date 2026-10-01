@@ -54,6 +54,15 @@ const SEND_DELAY_MS = Math.max(1000, parseInt(env.SEND_DELAY_MS, 10) || 3000);
 const MAX_REPLIES_PER_MIN = Math.max(1, parseInt(env.MAX_REPLIES_PER_MIN, 10) || 6); // ek chat ko 1 min me max itne AI reply
 const STARTED_AT = Date.now();
 const MAX_MSG_AGE_SEC = 120; // purane (offline) messages ko reply nahi dena
+const MAX_IMG_BYTES = 8 * 1024 * 1024; // is se badi photo skip
+const IMG_DEFAULT_Q = 'User ne ye photo bheji hai. Photo ko dhyan se dekho aur uske hisaab se jawab / madad do.';
+// Call reply (WhatsApp call aane par)
+const CALL_COOLDOWN_MS = Math.max(0, parseInt(env.CALL_COOLDOWN_SEC, 10) || 120) * 1000; // ek number ko dobara itni der tak call-msg nahi
+const CALL_ANSWERED_MSG =
+  env.CALL_ANSWERED_MSG || 'Call par baat karne ke liye bahut shukriya 🙏 Baad me koi aur baat ho to yahan message kar dijiye.';
+const CALL_MISSED_MSG =
+  env.CALL_MISSED_MSG ||
+  'Maaf kijiye, aapki call abhi receive nahi ho payi 🙏 Aap yahan apni baat ya samasya likh dijiye (chahein to photo bhi bhej sakte hain). Main use note kar leta hoon aur jaldi hi jawab diya jayega.';
 
 const numList = (v) =>
   (v || '')
@@ -97,7 +106,7 @@ function writeJson(file, data) {
 }
 
 const settings = Object.assign(
-  { autoReply: env.AUTO_REPLY !== 'false', schedulerOn: env.SCHEDULER !== 'off', dyn: [], disabled: [] },
+  { autoReply: env.AUTO_REPLY !== 'false', schedulerOn: env.SCHEDULER !== 'off', callReply: env.CALL_REPLY !== 'false', dyn: [], disabled: [] },
   readJson(SETTINGS_FILE, {})
 );
 const sent = readJson(SENT_FILE, {}); // "YYYY-MM-DD|id|HH:MM" -> true
@@ -165,16 +174,17 @@ async function callGemini(contents, system) {
   return { ok: false, text: 'Abhi jawab nahi de pa raha, thodi der baad try karo.' };
 }
 
-async function askGemini(jid, userText) {
+async function askGemini(jid, userText, image) {
   const h = history.get(jid) || [];
-  h.push({ role: 'user', text: userText });
+  h.push({ role: 'user', text: image ? `[Photo] ${userText}` : userText });
   // history hamesha 'user' se shuru honi chahiye (warna Gemini error de sakta hai)
   while (h.length > HISTORY_LIMIT || (h.length && h[0].role !== 'user')) h.shift();
 
-  const r = await callGemini(
-    h.map((m) => ({ role: m.role, parts: [{ text: m.text }] })),
-    SYSTEM_PROMPT
-  );
+  const contents = h.map((m) => ({ role: m.role, parts: [{ text: m.text }] }));
+  // photo sirf is baar ke message ke saath jati hai (history me sirf text rehta hai)
+  if (image) contents[contents.length - 1].parts.unshift({ inlineData: { mimeType: image.mimeType, data: image.data } });
+
+  const r = await callGemini(contents, SYSTEM_PROMPT);
   if (!r.ok) {
     h.pop();
     history.set(jid, h);
@@ -435,6 +445,31 @@ function enqueue(jid, fn) {
   });
 }
 
+function hasImage(m) {
+  const c = baileys.normalizeMessageContent ? baileys.normalizeMessageContent(m.message) : m.message;
+  return !!c?.imageMessage;
+}
+
+async function getImage(m, s) {
+  const c = baileys.normalizeMessageContent ? baileys.normalizeMessageContent(m.message) : m.message;
+  const img = c?.imageMessage;
+  if (!img) return null;
+  const buf = await baileys.downloadMediaMessage(m, 'buffer', {}, { logger, reuploadRequest: s.updateMediaMessage });
+  if (!buf || !buf.length || buf.length > MAX_IMG_BYTES) return null;
+  return { mimeType: img.mimetype || 'image/jpeg', data: Buffer.from(buf).toString('base64') };
+}
+
+// call ke baad bot ko context mile (user jab reply kare to bot ko pata ho ki call ki baat chal rahi hai)
+function pushHistory(jid, userNote, modelText) {
+  const h = history.get(jid) || [];
+  h.push({ role: 'user', text: userNote }, { role: 'model', text: modelText });
+  while (h.length > HISTORY_LIMIT || (h.length && h[0].role !== 'user')) h.shift();
+  history.set(jid, h);
+}
+
+const callState = new Map(); // callId -> { jid, accepted, video }
+const lastCallReply = new Map(); // number -> time
+
 async function startSock() {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -453,6 +488,8 @@ async function startSock() {
     browser: Browsers.ubuntu('Chrome'),
     markOnlineOnConnect: false,
     syncFullHistory: false,
+    // WhatsApp retry maange to original message wapas de (warna "Waiting for this message" aata hai)
+    getMessage: async (key) => sentMsgs.get(key.id) || undefined,
   });
   sock = s;
   let codeRequested = false;
@@ -511,6 +548,7 @@ async function startSock() {
 
         const num = jidNum(m.key.remoteJidAlt || jid);
         const text = getText(m).trim();
+        const img = hasImage(m);
         const selfChat = m.key.fromMe && isSelfChat(s, jid);
         if (type === 'append' && !selfChat) continue;
 
@@ -536,7 +574,7 @@ async function startSock() {
         if (jid.endsWith('@g.us') && !REPLY_IN_GROUPS) continue;
         if (BLOCKED.includes(num) || BLOCKED.includes(jid)) continue;
         if (ALLOWED.length && !ALLOWED.includes(num) && !ALLOWED.includes(jid)) continue;
-        if (!text) continue;
+        if (!text && !img) continue;
         if (!rateOk(jid)) {
           log(`rate limit: ${jid} ko reply skip`);
           continue;
@@ -544,11 +582,69 @@ async function startSock() {
 
         enqueue(jid, async () => {
           await s.sendPresenceUpdate('composing', jid).catch(() => {});
-          const reply = await askGemini(jid, text);
+          let image = null;
+          if (img) {
+            image = await getImage(m, s).catch((e) => {
+              log('image error:', e.message);
+              return null;
+            });
+            if (!image) {
+              noteSent(await s.sendMessage(jid, { text: 'Photo mujhe khul nahi payi, kripya dobara bhej dijiye 🙏' }, { quoted: m }));
+              return;
+            }
+          }
+          const reply = await askGemini(jid, text || IMG_DEFAULT_Q, image);
           noteSent(await s.sendMessage(jid, { text: reply }, { quoted: m }));
         });
       } catch (e) {
         log('message error:', e.message);
+      }
+    }
+  });
+
+  // ---- WhatsApp CALL: uthayi to shukriya, nahi uthayi to maafi + samasya puchho ----
+  s.ev.on('call', async (list) => {
+    for (const c of list || []) {
+      try {
+        log('call event:', c.status, c.id, c.chatId || c.from, c.isVideo ? 'video' : '', c.offline ? 'offline' : '');
+        const jid = c.chatId || c.from;
+        if (c.status === 'offer') {
+          if (c.isGroup || !jid || jid.endsWith('@g.us') || c.offline) continue;
+          callState.set(c.id, { jid, accepted: false, video: !!c.isVideo });
+          if (callState.size > 100) callState.delete(callState.keys().next().value);
+          continue;
+        }
+        const st = callState.get(c.id);
+        if (!st) continue;
+        if (c.status === 'accept') {
+          st.accepted = true;
+          continue;
+        }
+        if (c.status !== 'timeout' && c.status !== 'reject' && c.status !== 'terminate') continue;
+        callState.delete(c.id);
+
+        if (!settings.callReply) continue;
+        const num = jidNum(st.jid);
+        if (BLOCKED.includes(num) || BLOCKED.includes(st.jid)) continue;
+        if (ALLOWED.length && !ALLOWED.includes(num) && !ALLOWED.includes(st.jid)) continue;
+        if (Date.now() - (lastCallReply.get(num) || 0) < CALL_COOLDOWN_MS) continue;
+        lastCallReply.set(num, Date.now());
+
+        const answered = st.accepted;
+        const msg = answered ? CALL_ANSWERED_MSG : CALL_MISSED_MSG;
+        await sleep(2000 + Math.random() * 2000);
+        noteSent(await s.sendMessage(st.jid, { text: msg }));
+        pushHistory(
+          st.jid,
+          answered
+            ? '[System: is vyakti ne abhi call ki thi aur baat hui. Maine shukriya bola.]'
+            : '[System: is vyakti ne abhi call ki thi par call uthayi nahi gayi. Maine maafi mangi aur unki baat / samasya puchi. Ab unki baat dhyan se suno, madad karo, aur kaho ki unka message note kar liya gaya hai.]',
+          msg
+        );
+        log(`call reply (${answered ? 'answered' : 'missed'}) -> ${num}`);
+        if (!answered) await alertOwner(`📞 Missed ${st.video ? 'video ' : ''}call: ${num}. Maine unse unki baat puchi hai.`);
+      } catch (e) {
+        log('call error:', e.message);
       }
     }
   });
@@ -558,11 +654,16 @@ async function startSock() {
 //  WHATSAPP CONTROL COMMANDS  (!help likh kar dekho)
 // =====================================================================
 const botSent = new Set();
+const sentMsgs = new Map(); // id -> message (WhatsApp retry ke liye, "Waiting for this message" fix)
 function noteSent(r) {
   const id = r?.key?.id;
   if (!id) return;
   botSent.add(id);
   if (botSent.size > 500) botSent.delete(botSent.values().next().value);
+  if (r.message) {
+    sentMsgs.set(id, r.message);
+    if (sentMsgs.size > 500) sentMsgs.delete(sentMsgs.keys().next().value);
+  }
 }
 
 function getText(m) {
@@ -589,6 +690,7 @@ Commands ! ya / se shuru karo.
 
 *Reply*
 !reply on/off – AI auto reply
+!calls on/off – call aane par auto message
 !groups on/off – groups me reply
 !prompt – dekho | !prompt <text> – naya | !prompt reset
 !model <naam> | !model reset
@@ -656,7 +758,7 @@ async function handleCommand(body) {
       const n = nowParts();
       return `Status: ${status}
 Time: ${n.date} ${String(n.hh).padStart(2, '0')}:${String(n.mm).padStart(2, '0')} (${TZ})
-Auto reply: ${settings.autoReply ? 'ON' : 'OFF'} | Groups: ${REPLY_IN_GROUPS ? 'ON' : 'OFF'}
+Auto reply: ${settings.autoReply ? 'ON' : 'OFF'} | Groups: ${REPLY_IN_GROUPS ? 'ON' : 'OFF'} | Calls: ${settings.callReply ? 'ON' : 'OFF'}
 Scheduler: ${settings.schedulerOn ? 'ON' : 'OFF'} | Schedules: ${SCHEDULES.length}
 Model: ${GEMINI_MODEL}
 Allowed: ${ALLOWED.length || 'sab'} | Blocked: ${BLOCKED.length}
@@ -669,6 +771,15 @@ Uptime: ${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() %
       settings.autoReply = v;
       saveSettings();
       return `Auto reply ${v ? 'ON ✅' : 'OFF ⛔'}`;
+    }
+
+    case 'calls':
+    case 'call': {
+      const v = onoff(arg);
+      if (v === null) return 'Use: !calls on ya !calls off';
+      settings.callReply = v;
+      saveSettings();
+      return `Call reply ${v ? 'ON ✅' : 'OFF ⛔'}`;
     }
 
     case 'scheduler': {
