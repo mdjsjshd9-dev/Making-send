@@ -15,6 +15,8 @@ WhatsApp par Gemini AI se auto reply karne wala bot, saath me **scheduled messag
 - **Schedule preview**: bheje bina dekho ki AI message kaisa banega (`!preview`)
 - **Group ID nikaalna aur groups me schedule bhejna** (`!gid`)
 - **Spam / ban se bachav**: har chat par reply limit, insaani jaisa gap, purane aur duplicate messages ignore
+- **Call reply**: WhatsApp call uthayi to shukriya message, na uthayi to maafi + samasya puchhta hai (aur aapko alert bhejta hai)
+- **Photo samajhna**: koi photo bheje to Gemini use dekh kar reply karta hai
 - Session Railway Volume me save, redeploy par dobara link nahi karna padta
 
 ## Repo me kaun si file kya karti hai
@@ -77,6 +79,10 @@ Code kuch der me expire ho jata hai, bot khud naya code bana leta hai aur page a
 | `BLOCKED_NUMBERS` | khali | Inko kabhi reply nahi |
 | `HISTORY_LIMIT` | `12` | Kitne purane messages yaad rakhe (kam se kam 2) |
 | `MAX_REPLIES_PER_MIN` | `6` | Ek chat ko 1 minute me max itne AI reply. Isse zyada aaye to bot chup rehta hai (spam / loop se bachav) |
+| `CALL_REPLY` | `true` | `false` = call aane par koi message nahi |
+| `CALL_ANSWERED_MSG` | shukriya wala message | Call uthane par jo bhejna ho |
+| `CALL_MISSED_MSG` | maafi + samasya puchne wala | Call na uthane par jo bhejna ho |
+| `CALL_COOLDOWN_SEC` | `120` | Ek number ko itni der tak dobara call-message nahi (baar-baar call par spam se bachav) |
 | `SCHEDULER` | `on` | `off` = saare schedules band |
 | `SCHEDULE_TARGETS` | `PHONE_NUMBER` | Schedule kin numbers ko jaye (comma se alag) |
 | `SCHEDULE_CATCHUP_MIN` | `10` | Bot down tha to itne minute tak late bhej dega |
@@ -173,6 +179,12 @@ Example:
 Chat se kiye gaye badlav `/data` Volume me save hote hain aur Railway Variables se **upar** chalte hain. `reset` likhne par wapas Variables wali value chalu ho jaati hai. Railway ke `SCHEDULE_n` wale schedules `!del` se nahi hatte, unhe `!off N` se band karo.
 
 `!restart` ke baad bot 20-30 second me wapas aata hai. Railway max 10 baar auto restart karta hai (`railway.json`), isliye `!restart` baar-baar mat chalao.
+
+## Call aur Photo
+
+- **Call**: bot jab chal raha ho aur aapke number par WhatsApp call aaye. Call uthayi to `CALL_ANSWERED_MSG`, na uthayi (ya cut kar di) to `CALL_MISSED_MSG` jata hai aur aapko "Missed call" alert milta hai. Group call par kuch nahi hota. Chat se `!calls on/off`.
+- **Photo**: koi photo (caption ke saath ya bina) bheje to bot use dekh kar reply karta hai. 8 MB se badi photo ya jo download na ho, uske liye bot dobara bhejne ko kehta hai.
+- Call kaise pakdi gayi ye Railway logs me `call event:` wali lines me dikhta hai.
 
 ## Group me schedule bhejna
 1. Bot ka number us group ka member hona chahiye.
