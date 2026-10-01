@@ -224,6 +224,8 @@ Domain kholne par (connected hone ke baad):
 3. Volume laga hai to WhatsApp link, chat wale schedules aur settings bache rehte hain.
 
 ## Problems
+
+**"Waiting for this message" dikhe:** bot ko Baileys 7 (`package.json` me `7.0.0-rc14`) par rakho aur code me `getMessage` laga hai. Phir bhi aaye to web panel se **Logout / naya link karo**, phone ke Linked Devices se purana device hata ke dobara link karo. Pehle se atke hue messages theek nahi hote, naye theek jayenge.
 | Problem | Fix |
 |---|---|
 | Pairing code nahi aa raha | `PHONE_NUMBER` sahi (country code, bina + ya space) hai? Logs dekho |

@@ -4,10 +4,21 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
-const baileys = require('@whiskeysockets/baileys');
 
-const makeWASocket = baileys.default || baileys.makeWASocket;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = baileys;
+// Baileys v7 ESM hai, isliye dynamic import (CommonJS aur ESM dono me chalta hai)
+let baileys, makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers, makeCacheableSignalKeyStore;
+async function loadBaileys() {
+  const mod = await import('@whiskeysockets/baileys');
+  const pick = (k) => mod[k] ?? mod.default?.[k];
+  makeWASocket = pick('makeWASocket') || (typeof mod.default === 'function' ? mod.default : mod.default?.default);
+  useMultiFileAuthState = pick('useMultiFileAuthState');
+  DisconnectReason = pick('DisconnectReason');
+  fetchLatestBaileysVersion = pick('fetchLatestBaileysVersion');
+  Browsers = pick('Browsers');
+  makeCacheableSignalKeyStore = pick('makeCacheableSignalKeyStore');
+  baileys = { normalizeMessageContent: pick('normalizeMessageContent'), downloadMediaMessage: pick('downloadMediaMessage') };
+  if (typeof makeWASocket !== 'function') throw new Error('Baileys load nahi hua (makeWASocket nahi mila)');
+}
 
 // =====================================================================
 //  CONFIG  (sab kuch Railway > Variables se control hota hai)
@@ -483,7 +494,7 @@ async function startSock() {
 
   const s = makeWASocket({
     ...(version ? { version } : {}),
-    auth: state,
+    auth: makeCacheableSignalKeyStore ? { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) } : state,
     logger,
     browser: Browsers.ubuntu('Chrome'),
     markOnlineOnConnect: false,
@@ -1036,4 +1047,6 @@ process.on('uncaughtException', (e) => log('uncaughtException:', e?.message || e
 applySettings();
 log(`Data folder: ${DATA_DIR} ${DATA_DIR === '.' ? '(VOLUME NAHI LAGA - redeploy par session ud jayega)' : '(volume OK)'} | Model: ${GEMINI_MODEL}`);
 log(`Timezone: ${TZ} | Schedules loaded: ${SCHEDULES.length} | Auto reply: ${settings.autoReply}`);
-startSock().catch((e) => log('start error:', e.message));
+loadBaileys()
+  .then(() => startSock())
+  .catch((e) => log('start error:', e.message));
