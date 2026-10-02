@@ -18,13 +18,15 @@ WhatsApp par Gemini AI se auto reply karne wala bot, saath me **scheduled messag
 - **Call reply**: WhatsApp call uthayi to shukriya message, na uthayi to maafi + samasya puchhta hai (aur aapko alert bhejta hai)
 - **Photo samajhna**: koi photo bheje to Gemini use dekh kar reply karta hai
 - Session Railway Volume me save, redeploy par dobara link nahi karna padta
+- **🎙 Plus (naya)**: bot bol bhi sakta hai (Gemini TTS voice note), voice note sunkar samajhta hai, call aane par **approve / cancel** poochta hai, repeat call par khud sambhalta hai, PDF / video padhta hai, sticker, reminder, mausam aur bahut kuch. Poori list neeche **Plus features** section me hai.
 
 ## Repo me kaun si file kya karti hai
 | File | Kaam |
 |---|---|
 | `index.js` | Poora bot (WhatsApp, Gemini, scheduler, commands, web panel) |
+| `plus.js` | **Naya.** Voice (TTS), call approval, media, tools, `/plus` panel. `index.js` ise khud load karta hai, dono file saath chahiye |
 | `package.json` | Dependencies (Baileys, Express, Pino), Node 20+ |
-| `Dockerfile` | Railway par build karne ke liye (git install hota hai kyunki Baileys ki ek dependency GitHub se aati hai) |
+| `Dockerfile` | Railway par build karne ke liye (git: Baileys ki dependency GitHub se aati hai, ffmpeg: voice note aur sticker banane ke liye) |
 | `railway.json` | Railway deploy settings: Dockerfile build, `/health` healthcheck, fail hone par auto restart (max 10 baar) |
 | `.gitignore`, `.dockerignore` | Faltu files upload/build hone se rokte hain |
 | `README.md` | Ye guide |
@@ -34,7 +36,7 @@ WhatsApp par Gemini AI se auto reply karne wala bot, saath me **scheduled messag
 ### 1. GitHub repo banao
 1. Phone browser me github.com kholo, login karo, **Desktop site** on karo.
 2. **New repository** banao (Private rakhna better hai).
-3. **Add file → Upload files** se ye files upload karo: `index.js`, `package.json`, `Dockerfile`, `railway.json`, `.gitignore`, `.dockerignore`, `README.md`.
+3. **Add file → Upload files** se ye files upload karo: `index.js`, `plus.js`, `package.json`, `Dockerfile`, `railway.json`, `.gitignore`, `.dockerignore`, `README.md`.
 4. **Commit changes** dabao.
 
 ### 2. Railway par deploy
@@ -182,9 +184,86 @@ Chat se kiye gaye badlav `/data` Volume me save hote hain aur Railway Variables 
 
 ## Call aur Photo
 
-- **Call**: bot jab chal raha ho aur aapke number par WhatsApp call aaye. Call uthayi to `CALL_ANSWERED_MSG`, na uthayi (ya cut kar di) to `CALL_MISSED_MSG` jata hai aur aapko "Missed call" alert milta hai. Group call par kuch nahi hota. Chat se `!calls on/off`.
+- **Call**: bot jab chal raha ho aur aapke number par WhatsApp call aaye. Call uthayi to `CALL_ANSWERED_MSG`, na uthayi (ya cut kar di) to `CALL_MISSED_MSG` jata hai aur aapko "Missed call" alert milta hai. Group call par kuch nahi hota. Chat se `!calls on/off`. Approve wala naya system alag hai, neeche **Plus features → Calls** dekho (`!callmode off` karoge to sirf ye purana tareeka chalega).
 - **Photo**: koi photo (caption ke saath ya bina) bheje to bot use dekh kar reply karta hai. 8 MB se badi photo ya jo download na ho, uske liye bot dobara bhejne ko kehta hai.
 - Call kaise pakdi gayi ye Railway logs me `call event:` wali lines me dikhta hai.
+
+## 🎙 Plus features (voice, calls, tools)
+
+Ye sab `plus.js` me hain. Menu dekhne ke liye bot ke chat me `!plus` likho. Panel: `https://<aapka-domain>/plus`.
+
+### Call kaise kaam karti hai (zaroori)
+WhatsApp ki **live call me bot bol nahi sakta** (Baileys call ka audio support nahi karta). Isliye:
+- Call aaye to aapke "Message yourself" chat me prompt aata hai: **1 = approve, 2 = cancel** (panel `/plus` me bhi buttons hain)
+- **Approve**: bot call reject karke caller ko **voice note** bhejta hai aur voice chat shuru ho jati hai (caller voice note ya text bheje, bot voice me jawab de)
+- **Cancel**: bot bilkul hat jata hai, koi message nahi jata
+- Jawab na do to `CALL_APPROVAL_SEC` ke baad default chalta hai (`ignore` = purana missed-call message)
+- Call kat gayi aur `REPEAT_CALL_MIN` (10 min) ke andar **dobara aayi** to bot bina poochhe khud sambhalta hai
+- Asli live call me baat ke liye Meta ka WhatsApp Business Calling API chahiye (alag setup aur approval)
+
+### Plus variables (sab optional)
+| Variable | Default | Kaam |
+|---|---|---|
+| `TTS_VOICE` | `Kore` | Bot ki awaaz (30 options, `!voice` se list) |
+| `REPLY_MODE` | `text` | `text` / `voice` / `both` |
+| `CALL_APPROVAL_SEC` | `25` | Approve ka jawab dene ka time |
+| `CALL_APPROVAL_DEFAULT` | `ignore` | Time khatam hone par: `ignore` ya `auto` (khud baat kare) |
+| `REPEAT_CALL_MIN` | `10` | Itne minute me dobara call aaye to auto-answer |
+| `VOICE_SESSION_MIN` | `10` | Voice chat itni der shant rahe to khatam + aapko summary |
+| `CALL_GREETING` | default greeting | Approve ke baad caller ko jo voice note jaye |
+| `CALL_REJECT_ON_APPROVE` | `true` | `false` = call ringing chhod do, sirf voice note bhejo |
+| `PUBLIC_CMDS` | `true` | `false` = `!tts`, `!weather` jaise commands sirf aap chala sako |
+| `FLOOD_LIMIT` | `25` | 1 minute me itne se zyada message bheje to 1 ghante ignore |
+| `BROADCAST_MAX` | `30` | `!bc` se ek baar me max itne log |
+| `GEMINI_TTS_MODEL` | `gemini-2.5-flash-preview-tts` | Awaaz wala model |
+| `GEMINI_IMAGE_MODEL` | `gemini-2.5-flash-image` | `!imagine` wala model |
+
+### Kya-kya naya hai
+- **Voice**: voice note reply (Gemini TTS), voice note sunkar jawab, 30 awaazein, tone, text/voice/both mode, voice ka jawab voice me (mirror), `!say`, `!sayto`, scheduled voice, TTS fail ho to text, panel me awaaz sunna aur voice inbox
+- **Calls**: approve/cancel, repeat call auto-answer, approval timeout, VIP list, DND time, call log, custom greeting, voice chat khatam hone par summary, panel buttons
+- **Media**: PDF padhna, video samajhna, location bhejne par mausam, `!sticker`, `!imagine`, `!ocr`, `!poll`
+- **AI**: personas, language lock, knowledge base, busy mode, naye logon ko welcome, `!tr`, `!summary`, user ka naam yaad
+- **Tools**: `!weather`, `!calc`, `!remind`, `!note`, `!joke`
+- **Admin**: flood auto-block, `!stats`, daily report, `!bc`, blue tick aur typing delay on/off, restart ke baad bhi history yaad
+
+### Plus commands
+Owner ke commands (aapke chat me):
+
+| Command | Kaam |
+|---|---|
+| `!plus` | Poora menu |
+| `!say <text>` | Apne chat me voice note |
+| `!sayto <number> <text>` | Kisi ko voice note |
+| `!voice` / `!voice Puck` | Awaaz list / badlo |
+| `!tone <style>` / `!tone reset` | Bolne ka andaaz (jaise `cheerfully`) |
+| `!mode text\|voice\|both [number]` | Sabke liye ya ek number ke liye reply mode |
+| `!mirror on/off` | Voice aaye to voice me jawab |
+| `!callmode ask\|auto\|off` | ask = approve poochega, auto = khud uthayega, off = sirf purana tareeka |
+| `!approve [id]` / `!cancel [id]` | Call approve / cancel (ya seedha `1` / `2` likho) |
+| `!callvip add/del/list <number>` | In numbers ki call hamesha auto-answer |
+| `!callgreet <text>` / `reset` | Call ke baad jo bola jaye |
+| `!calllog` | Pichli calls |
+| `!sessions` / `!endvoice [number\|all]` | Chalti voice chats dekho / band karo |
+| `!dnd 23:00-07:00` / `!dnd off` | Is time approval nahi poochega, bot khud call sambhalega |
+| `!persona [naam]` | friendly, teacher, funny, formal, shayar, support, coach |
+| `!lang hindi\|english\|hinglish\|auto` | Jawab ki bhasha |
+| `!kb add/del/list/clear` | Bot ko jaankari / FAQ do |
+| `!busy <wajah>` / `!busy off` | Bot logon ko batayega ki aap busy ho |
+| `!welcome <text>` / `off` | Naye logon ko pehla message |
+| `!summary [number]` | Chat ka summary |
+| `!imagine <prompt>` | Image banao |
+| `!remind 30m \| text` / `!remind 18:30 \| text` / `list` / `del N` | Yaad dilao |
+| `!note <text>` / `!note list/del N/clear` | Notes |
+| `!poll Sawal \| a \| b \| c` | Poll |
+| `!stats` / `!report 22:00` / `!report off` | Aaj ke aankde / daily report |
+| `!bc 9198..,9199.. \| text` / `!bc all \| text` | Broadcast (ban risk, kam logon ko) |
+| `!read on/off` / `!typing on/off` | Blue tick / insaani typing gap |
+
+Sabke liye (jab `PUBLIC_CMDS=true`): `!tts <text>`, `!tr hindi \| text`, `!weather <shehar>`, `!calc 25*4`, `!joke`, `!sticker` (photo caption me ya photo ko reply karke), `!ocr` (photo se text).
+
+Scheduled voice: `SCHEDULE_3 = 06:00 | voice: Good morning!` ya AI wala `06:00 | voice: ai: ek motivational good morning`.
+
+Limits: voice note, PDF aur video 10 MB tak. Voice reply lamba ho to pehla hissa bola jata hai (~900 akshar).
 
 ## Group me schedule bhejna
 1. Bot ka number us group ka member hona chahiye.
@@ -202,7 +281,7 @@ Group me bot ka AI reply tabhi aayega jab `!groups on` (ya `REPLY_IN_GROUPS=true
 - **Duplicate messages ignore**: ek hi message do baar aaye to ek hi reply.
 - **Reply limit**: ek chat ko 1 minute me `MAX_REPLIES_PER_MIN` se zyada AI reply nahi.
 - **Insaani gap**: reply se pehle 1-3 second ka random gap, aur "typing..." dikhta hai.
-- **Sirf text**: text ya photo/video ke caption ka reply aata hai. Bina text wale message (voice note, sticker, etc.) ignore hote hain.
+- **Kya samajhta hai**: text, photo, voice note, PDF, video aur location. Sticker jaise baaki message ignore hote hain.
 - **Ek chat ke messages line se**: ek chat ke messages ek-ek karke process hote hain.
 - **Auto reconnect**: WhatsApp disconnect ho to bot khud dobara judta hai. Baar-baar fail ho to gap badhata jata hai (3s, 6s, 12s ... max 60s) taaki ban risk na bane.
 - **Gemini fail**: pehle 1 baar dobara try, phir fallback models. Sab fail hon to chat me "Abhi jawab nahi de pa raha, thodi der baad try karo." jata hai.
@@ -216,10 +295,12 @@ Domain kholne par (connected hone ke baad):
 - Har schedule ke saamne **Abhi bhejo** (test)
 - Logout / naya link
 
+- **🎙 Voice, Calls & Plus panel** ka button (`/plus` page)
+
 `/health` page Railway healthcheck ke liye hai (bina password ke "ok" dikhata hai).
 
 ## Code update kaise karein
-1. GitHub repo me `index.js` (ya jo file badli ho) kholo → pencil/Upload se nayi file dalo → **Commit changes**.
+1. GitHub repo me `index.js` aur `plus.js` (ya jo file badli ho) kholo → pencil/Upload se nayi file dalo → **Commit changes**.
 2. Railway apne aap redeploy karega.
 3. Volume laga hai to WhatsApp link, chat wale schedules aur settings bache rehte hain.
 
@@ -241,6 +322,11 @@ Domain kholne par (connected hone ke baad):
 | `!restart` ke baad bot wapas nahi aaya | Railway logs dekho. Max 10 auto restart ki limit ho sakti hai, Railway se manual redeploy karo |
 | Logs me `connectionReplaced` | Same WhatsApp session kisi aur jagah bhi chal raha hai (dusra deploy / local). Ek hi jagah chalao |
 | Session logout ho gaya | Panel me naya pairing code lo |
+| Voice note nahi ja raha, text aa raha hai | Logs me `voice fail` dekho. `GEMINI_API_KEY` / TTS quota check karo, aur Build logs me ffmpeg install hua ya nahi |
+| Logs me `ffmpeg nahi mila` | `Dockerfile` naya wala upload karo (usme ffmpeg hai) aur redeploy karo |
+| Call par approve prompt nahi aaya | `!callmode` dekho (`off` to nahi?), bot connected ho, aur call kisi group ki na ho |
+| Approve ke baad bhi call kat gayi | Normal hai: bot call reject karke voice note bhejta hai, live call me baat nahi kar sakta |
+| `!imagine` error | Image model ka quota / naam check karo (`GEMINI_IMAGE_MODEL`), free tier me ye na chale to ye normal hai |
 
 ## Dhyan rakhein
 Ye unofficial WhatsApp Web library (Baileys) use karta hai. Bahut zyada ya unknown logon ko bulk messages bhejne se number ban ho sakta hai. Zyada testing ke liye alag number use karo aur sirf jaan-pehchan walon ko schedule bhejo. Bot ke apne reply limit aur send delay isi liye hain, unhe kam mat karo.

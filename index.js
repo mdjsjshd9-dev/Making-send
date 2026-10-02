@@ -187,7 +187,7 @@ async function callGemini(contents, system) {
 
 async function askGemini(jid, userText, image) {
   const h = history.get(jid) || [];
-  h.push({ role: 'user', text: image ? `[Photo] ${userText}` : userText });
+  h.push({ role: 'user', text: image ? `[${image.label || 'Photo'}] ${userText}` : userText });
   // history hamesha 'user' se shuru honi chahiye (warna Gemini error de sakta hai)
   while (h.length > HISTORY_LIMIT || (h.length && h[0].role !== 'user')) h.shift();
 
@@ -195,7 +195,7 @@ async function askGemini(jid, userText, image) {
   // photo sirf is baar ke message ke saath jati hai (history me sirf text rehta hai)
   if (image) contents[contents.length - 1].parts.unshift({ inlineData: { mimeType: image.mimeType, data: image.data } });
 
-  const r = await callGemini(contents, SYSTEM_PROMPT);
+  const r = await callGemini(contents, SYSTEM_PROMPT + plus.extraSystem(jid));
   if (!r.ok) {
     h.pop();
     history.set(jid, h);
@@ -324,7 +324,7 @@ async function buildMessage(sch, opts = {}) {
       .replace(/\{date\}/gi, d.toLocaleDateString('en-IN', { timeZone: TZ, dateStyle: 'full' }))
       .replace(/\{day\}/gi, d.toLocaleDateString('en-IN', { timeZone: TZ, weekday: 'long' }))
       .replace(/\{time\}/gi, d.toLocaleTimeString('en-IN', { timeZone: TZ, hour: '2-digit', minute: '2-digit' }));
-  const msg = fill(sch.message);
+  const msg = fill(sch.message).replace(/^voice:\s*/i, ''); // "voice:" prefix plus.js me bolkar jata hai
   // "ai:" se shuru ho to Gemini har baar naya message likhega
   if (/^ai:/i.test(msg)) {
     const base = msg.replace(/^ai:/i, '').trim();
@@ -360,7 +360,7 @@ async function runSchedule(sch) {
   }
   for (const t of sch.targets) {
     try {
-      noteSent(await sock.sendMessage(toJid(t), { text }));
+      await plus.deliver(toJid(t), text, /^voice:/i.test(sch.message));
       log(`${sch.id}: sent to ${t}`);
     } catch (e) {
       log(`${sch.id}: send fail ${t}:`, e.message);
@@ -566,15 +566,16 @@ async function startSock() {
         // ---- WhatsApp se control (commands) ----
         const isCmd = CMD_PREFIXES.some((p) => text.startsWith(p));
         const fromOwner = !m.key.fromMe && !jid.endsWith('@g.us') && OWNERS.includes(num);
+        if (await plus.pre({ m, s, jid, num, text, selfChat, fromOwner })) continue; // PLUS: approval reply, flood, stats
         if (isCmd && (selfChat || fromOwner)) {
           enqueue(jid, async () => {
             let out;
             try {
-              out = await handleCommand(text.slice(1).trim());
+              out = await handleCommand(text.slice(1).trim(), { m, s, jid, num });
             } catch (e) {
               out = 'Error: ' + e.message;
             }
-            noteSent(await s.sendMessage(jid, { text: '🤖 ' + out }));
+            if (out != null) noteSent(await s.sendMessage(jid, { text: '🤖 ' + out }));
           });
           continue;
         }
@@ -585,9 +586,14 @@ async function startSock() {
         if (jid.endsWith('@g.us') && !REPLY_IN_GROUPS) continue;
         if (BLOCKED.includes(num) || BLOCKED.includes(jid)) continue;
         if (ALLOWED.length && !ALLOWED.includes(num) && !ALLOWED.includes(jid)) continue;
-        if (!text && !img) continue;
+        if (!text && !img && !plus.wants(m, text)) continue;
         if (!rateOk(jid)) {
           log(`rate limit: ${jid} ko reply skip`);
+          continue;
+        }
+
+        if (plus.wants(m, text)) {
+          enqueue(jid, () => plus.handle({ m, s, jid, num, text })); // PLUS: voice note, pdf, video, location, public cmds
           continue;
         }
 
@@ -605,7 +611,7 @@ async function startSock() {
             }
           }
           const reply = await askGemini(jid, text || IMG_DEFAULT_Q, image);
-          noteSent(await s.sendMessage(jid, { text: reply }, { quoted: m }));
+          await plus.sendReply(s, jid, reply, m);
         });
       } catch (e) {
         log('message error:', e.message);
@@ -622,6 +628,7 @@ async function startSock() {
         if (c.status === 'offer') {
           if (c.isGroup || !jid || jid.endsWith('@g.us') || c.offline) continue;
           callState.set(c.id, { jid, accepted: false, video: !!c.isVideo });
+          plus.onCallOffer({ id: c.id, from: c.from, jid, video: !!c.isVideo, num: jidNum(c.callerPn || jid) }).catch((e) => log('plus call error:', e.message));
           if (callState.size > 100) callState.delete(callState.keys().next().value);
           continue;
         }
@@ -629,10 +636,13 @@ async function startSock() {
         if (!st) continue;
         if (c.status === 'accept') {
           st.accepted = true;
+          plus.onCallAccepted(c.id);
           continue;
         }
         if (c.status !== 'timeout' && c.status !== 'reject' && c.status !== 'terminate') continue;
         callState.delete(c.id);
+        plus.onCallEnd(c.id, st.accepted);
+        if (plus.callHandled(c.id)) continue; // bot ne sambhal li / owner ne cancel kiya
 
         if (!settings.callReply) continue;
         const num = jidNum(st.jid);
@@ -722,6 +732,9 @@ Commands ! ya / se shuru karo.
 !targets <n1,n2> | !targets reset
 !tz Asia/Kolkata
 
+*Plus (voice / calls / AI)*
+!plus – naye features ka poora menu
+
 *Baaki*
 !gid – apne groups ki ID dekho
 !send <number ya group-ID> <message>
@@ -753,7 +766,7 @@ function listCmd(key, label, arg) {
   return `${label}: ${(settings[key] ?? envList).join(', ') || 'khali'}`;
 }
 
-async function handleCommand(body) {
+async function handleCommand(body, meta) {
   const m = body.match(/^(\S+)\s*([\s\S]*)$/);
   if (!m) return HELP;
   const cmd = m[1].toLowerCase();
@@ -927,8 +940,11 @@ Uptime: ${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() %
       setTimeout(() => process.exit(1), 1500); // Railway apne aap dobara chalu kar deta hai
       return 'Restart ho raha hai, 20-30 sec me wapas aata hoon...';
 
-    default:
+    default: {
+      const r = await plus.command(cmd, arg, meta || {});
+      if (r !== undefined) return r;
       return `"${cmd}" command nahi mila. !help likho.`;
+    }
   }
 }
 
@@ -975,6 +991,22 @@ button.red{background:#dc2626}button.gray{background:#4b5563}button.sm{width:aut
 </style></head><body><div class="wrap">${body}</div></body></html>`;
 }
 
+// =====================================================================
+//  PLUS MODULE (voice, call approval, tools) -> plus.js
+// =====================================================================
+const plus = require('./plus')({
+  env, log, sleep, readJson, writeJson, DATA_DIR, settings, saveSettings, history, logger,
+  jidNum, toJid, numList, esc, noteSent, alertOwner, callGemini, askGemini, getText,
+  getSock: () => sock,
+  getStatus: () => status,
+  getBaileys: () => baileys,
+  getTZ: () => TZ,
+  getBlocked: () => BLOCKED,
+  getAllowed: () => ALLOWED,
+  nowParts,
+});
+plus.routes(app, auth, page);
+
 app.get('/', auth, (req, res) => {
   let body;
   if (status === 'connected') {
@@ -994,6 +1026,7 @@ app.get('/', auth, (req, res) => {
       <div class="row"><span>Scheduler: <span class="${settings.schedulerOn ? 'on' : 'off'}">${settings.schedulerOn ? 'ON' : 'OFF'}</span></span>
       <form method="POST" action="/toggle/scheduler"><button class="sm">${settings.schedulerOn ? 'Band karo' : 'Chalu karo'}</button></form></div>
     </div>
+    <div class="card"><a href="/plus"><button class="gray">🎙 Voice, Calls & Plus panel</button></a></div>
     <div class="card"><h3>⏰ Scheduled messages</h3>${sched}</div>
     <div class="card"><form method="POST" action="/reset" onsubmit="return confirm('Session delete karein?')">
       <button class="red">Logout / naya link karo</button></form></div>`;
