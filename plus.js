@@ -7,22 +7,33 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 module.exports = function createPlus(ctx) {
-  const { env, log, sleep, readJson, writeJson, DATA_DIR, settings, saveSettings, history, jidNum, toJid, numList, esc, noteSent, alertOwner, callGemini, askGemini } = ctx;
+  const { env, log, sleep, readJson, writeJson, DATA_DIR, settings, saveSettings, history, jidNum, toJid, numList, esc, noteSent, alertOwner, callGemini, askGemini, pushHistory, withTimeout, fetchT, histAt } = ctx;
+  const CSRF = ctx.csrfInput || '';
 
   // ---------------------------------------------------------------- CONFIG
   const KEY = env.GEMINI_API_KEY || '';
-  const TTS_MODEL = env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
-  const IMG_MODEL = env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image';
-  const APPROVAL_SEC = Math.max(5, parseInt(env.CALL_APPROVAL_SEC, 10) || 25);
-  const APPROVAL_DEFAULT = (env.CALL_APPROVAL_DEFAULT || 'ignore').toLowerCase(); // ignore | auto
+  // model list (comma se alag): pehla fail / retire ho to agla chalta hai
+  const csv = (v, d) => String(v || d).split(',').map((x) => x.trim()).filter(Boolean);
+  const TTS_MODELS = csv(env.GEMINI_TTS_MODEL, 'gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts');
+  const IMG_MODELS = csv(env.GEMINI_IMAGE_MODEL, 'gemini-3.1-flash-image-preview,gemini-2.5-flash-image');
+  const APPROVAL_SEC = Math.max(5, parseInt(env.CALL_APPROVAL_SEC, 10) || 45);
+  const APPROVAL_DEFAULT = (env.CALL_APPROVAL_DEFAULT || 'ignore').toLowerCase(); // ignore = call kato + maafi msg | auto = khud voice me baat
   const REPEAT_MIN = Math.max(1, parseInt(env.REPEAT_CALL_MIN, 10) || 10);
   const SESSION_MIN = Math.max(1, parseInt(env.VOICE_SESSION_MIN, 10) || 10);
   const REJECT_ON_APPROVE = env.CALL_REJECT_ON_APPROVE !== 'false';
+  const REJECT_ON_TIMEOUT = env.CALL_REJECT_ON_TIMEOUT !== 'false'; // jawab na mile to call kat do
+  const CANCEL_REJECT = env.CALL_CANCEL_REJECT === 'true'; // Cancel (2) par call bhi kat do
+  const CALL_AI_MSG = env.CALL_AI_MSG !== 'false'; // call ke baad ka message AI se bane
+  const CALL_COOLDOWN_MS = Math.max(0, parseInt(env.CALL_COOLDOWN_SEC, 10) || 120) * 1000;
+  const FALLBACK_ANSWERED = env.CALL_ANSWERED_MSG || 'Call par baat karne ke liye shukriya 🙏 Koi aur baat ho to yahan message kar dijiye.';
+  const FALLBACK_MISSED = env.CALL_MISSED_MSG || 'Maaf kijiye, aapki call abhi receive nahi ho payi 🙏 Aap yahan apni baat ya samasya likh dijiye, main note kar leta hoon aur jaldi jawab diya jayega.';
+  const VOICE_INBOX = env.VOICE_INBOX === 'true'; // panel me voice sunna (privacy ke liye default band)
+  const MAX_VOICE_PARTS = Math.max(1, Math.min(5, parseInt(env.MAX_VOICE_PARTS, 10) || 3));
   const PUBLIC_CMDS = env.PUBLIC_CMDS !== 'false';
   const FLOOD_LIMIT = Math.max(5, parseInt(env.FLOOD_LIMIT, 10) || 25);
   const BC_MAX = Math.max(1, parseInt(env.BROADCAST_MAX, 10) || 30);
   const MAX_MEDIA = 10 * 1024 * 1024;
-  const MAX_TTS_CHARS = 900;
+  const MAX_TTS_CHARS = 800; // ek voice note me itne akshar; lamba jawab kai voice note me jata hai
 
   const VOICES = ['Kore', 'Puck', 'Charon', 'Zephyr', 'Fenrir', 'Leda', 'Orus', 'Aoede', 'Callirrhoe', 'Autonoe', 'Enceladus', 'Iapetus', 'Umbriel', 'Algieba', 'Despina', 'Erinome', 'Algenib', 'Rasalgethi', 'Laomedeia', 'Achernar', 'Alnilam', 'Schedar', 'Gacrux', 'Pulcherrima', 'Achird', 'Zubenelgenubi', 'Vindemiatrix', 'Sadachbia', 'Sadaltager', 'Sulafat'];
   const PERSONAS = {
@@ -49,7 +60,13 @@ module.exports = function createPlus(ctx) {
   const CONTACTS_FILE = path.join(DATA_DIR, 'contacts.json');
   const CALLLOG_FILE = path.join(DATA_DIR, 'calllog.json');
 
-  for (const [k, v] of Object.entries(readJson(HIST_FILE, {}))) if (Array.isArray(v)) history.set(k, v);
+  const loaded = readJson(HIST_FILE, {});
+  for (const [k, v] of Object.entries(loaded)) {
+    if (Array.isArray(v)) {
+      history.set(k, v);
+      histAt.set(k, Date.now());
+    }
+  }
   let stats = readJson(STATS_FILE, {});
   const contacts = readJson(CONTACTS_FILE, {});
   const callLog = readJson(CALLLOG_FILE, []);
@@ -59,11 +76,14 @@ module.exports = function createPlus(ctx) {
   const pending = new Map(); // approval id -> { id, entry, timer }
   const sessions = new Map(); // number/id -> session (same object under many ids)
   const recentCalls = new Map(); // num -> { at, accepted }
-  const handled = new Set(); // call ids jinhe bot ne sambhala (purana missed-call msg na jaye)
+  const lastFollow = new Map(); // num -> last call-message time
+  const callMsgHist = []; // pichle AI call-messages (repeat na ho)
+  let lastHistWrite = 0;
   const vflag = new Set(); // is waqt voice me jawab banana hai
   const tempBlocked = new Map(); // num -> until
   const floodMap = new Map();
   const voiceInbox = [];
+  let inboxBytes = 0;
   let seq = 0;
   let vseq = 0;
 
@@ -109,11 +129,17 @@ module.exports = function createPlus(ctx) {
     dirty.stats = true;
   }
 
-  function contact(num, jid, name) {
+  function contact(num, jid, name, isPn) {
     let c = contacts[num];
     if (!c) {
       c = contacts[num] = { first: Date.now(), count: 0, isNew: true };
+      const keys = Object.keys(contacts);
+      if (keys.length > 2500) {
+        // sabse purane contacts hata do (RAM / file badhne se roko)
+        keys.sort((a, b) => (contacts[a].last || 0) - (contacts[b].last || 0)).slice(0, 300).forEach((k) => delete contacts[k]);
+      }
     }
+    if (isPn !== undefined) c.pn = !!isPn; // pn = asli phone number pata hai (broadcast sirf inhe)
     if (name) c.name = name;
     c.last = Date.now();
     c.count += 1;
@@ -124,35 +150,49 @@ module.exports = function createPlus(ctx) {
   }
 
   function stash(dir, jid, buf, text) {
+    if (!VOICE_INBOX) return; // default: voice RAM me bhi nahi rakhte
     voiceInbox.push({ id: ++vseq, dir, num: jidNum(jid), at: Date.now(), buf, text: text || '' });
-    while (voiceInbox.length > 12) voiceInbox.shift();
+    inboxBytes += buf?.length || 0;
+    while (voiceInbox.length > 8 || inboxBytes > 20 * 1024 * 1024) inboxBytes -= voiceInbox.shift()?.buf?.length || 0;
   }
 
   // ---------------------------------------------------------------- GEMINI TTS + FFMPEG
-  async function gfetch(model, body) {
+  async function gfetch(models, body) {
     if (!KEY) throw new Error('GEMINI_API_KEY set nahi hai');
     let last;
-    for (let i = 1; i <= 2; i++) {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': KEY },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) return data;
-      last = new Error(`${model} ${res.status} ${(data?.error?.message || '').slice(0, 120)}`);
-      if (res.status >= 500 || res.status === 429) {
-        await sleep(2000);
-        continue;
+    for (const model of [].concat(models)) {
+      for (let i = 1; i <= 2; i++) {
+        try {
+          const res = await fetchT(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+            { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': KEY }, body: JSON.stringify(body) },
+            60000
+          );
+          const data = await res.json().catch(() => ({}));
+          if (res.ok) return data;
+          last = new Error(`${model} ${res.status} ${(data?.error?.message || '').slice(0, 120)}`);
+          log('gemini media error:', last.message);
+          if ((res.status >= 500 || res.status === 429) && i === 1) {
+            await sleep(2000);
+            continue;
+          }
+          break; // 400/404 etc -> agla model
+        } catch (e) {
+          last = e;
+          if (i === 1) {
+            await sleep(1500);
+            continue;
+          }
+          break;
+        }
       }
-      break;
     }
-    throw last;
+    throw last || new Error('Gemini fail');
   }
 
   async function ttsPcm(text, voice, tone) {
     const prompt = tone ? `Say ${tone}: ${text}` : text;
-    const data = await gfetch(TTS_MODEL, {
+    const data = await gfetch(TTS_MODELS, {
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: {
         responseModalities: ['AUDIO'],
@@ -167,14 +207,19 @@ module.exports = function createPlus(ctx) {
   function ff(args, input) {
     return new Promise((resolve, reject) => {
       const p = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...args]);
+      const killer = setTimeout(() => p.kill('SIGKILL'), 30000); // ffmpeg atke to band
       const out = [];
       const err = [];
       p.stdout.on('data', (d) => out.push(d));
       p.stderr.on('data', (d) => err.push(d));
-      p.on('error', (e) => reject(new Error('ffmpeg nahi mila: ' + e.message)));
-      p.on('close', (code) =>
-        code === 0 && out.length ? resolve(Buffer.concat(out)) : reject(new Error('ffmpeg fail: ' + Buffer.concat(err).toString().slice(0, 200)))
-      );
+      p.on('error', (e) => {
+        clearTimeout(killer);
+        reject(new Error('ffmpeg nahi mila: ' + e.message));
+      });
+      p.on('close', (code) => {
+        clearTimeout(killer);
+        code === 0 && out.length ? resolve(Buffer.concat(out)) : reject(new Error('ffmpeg fail: ' + Buffer.concat(err).toString().slice(0, 200)));
+      });
       p.stdin.on('error', () => {});
       p.stdin.end(input);
     });
@@ -210,23 +255,49 @@ module.exports = function createPlus(ctx) {
   const voiceName = () => settings.voice || env.TTS_VOICE || 'Kore';
 
   async function makeVoice(text, o = {}) {
-    const clean = clip(speakable(text), MAX_TTS_CHARS);
+    const clean = clip(String(text).trim(), MAX_TTS_CHARS + 100);
     if (!clean) throw new Error('bolne layak text nahi');
     const pcm = await ttsPcm(clean, o.voice || voiceName(), o.tone ?? settings.tone);
     const ogg = await pcmToOgg(pcm);
     return { pcm, ogg, secs: Math.max(1, Math.round(pcm.length / 48000)) };
   }
 
+  // lamba text vakya ki sima par tukdon me baanta jata hai (har tukda ek voice note). Bacha hua rest text me jata hai.
+  function splitForVoice(text) {
+    let rest = speakable(text);
+    const parts = [];
+    while (rest && parts.length < MAX_VOICE_PARTS) {
+      if (rest.length <= MAX_TTS_CHARS) {
+        parts.push(rest);
+        rest = '';
+        break;
+      }
+      const cut = rest.slice(0, MAX_TTS_CHARS);
+      const i = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('। '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
+      const sp = cut.lastIndexOf(' ');
+      const at = i > MAX_TTS_CHARS * 0.4 ? i + 1 : sp > 0 ? sp : MAX_TTS_CHARS;
+      parts.push(rest.slice(0, at).trim());
+      rest = rest.slice(at).trim();
+    }
+    return { parts, rest };
+  }
+
+  // returns { rest }: voice me na ja paya hissa (text me bhejna ho to)
   async function sendVoice(jid, text, quoted) {
     const s = S();
+    const { parts, rest } = splitForVoice(text);
+    if (!parts.length) throw new Error('bolne layak text nahi');
     await s.sendPresenceUpdate('recording', jid).catch(() => {});
-    const v = await makeVoice(text);
-    const r = await s.sendMessage(jid, { audio: v.ogg, mimetype: 'audio/ogg; codecs=opus', ptt: true, seconds: v.secs }, quoted ? { quoted } : undefined);
-    noteSent(r);
-    stash('out', jid, v.ogg, text);
-    bump('voiceOut');
+    for (let i = 0; i < parts.length; i++) {
+      const v = await makeVoice(parts[i]);
+      const r = await s.sendMessage(jid, { audio: v.ogg, mimetype: 'audio/ogg; codecs=opus', ptt: true, seconds: v.secs }, quoted && i === 0 ? { quoted } : undefined);
+      noteSent(r);
+      stash('out', jid, v.ogg, parts[i]);
+      bump('voiceOut');
+      if (i < parts.length - 1) await sleep(1200);
+    }
     s.sendPresenceUpdate('paused', jid).catch(() => {});
-    return r;
+    return { rest };
   }
 
   // ---------------------------------------------------------------- REPLY MODE / SEND
@@ -274,8 +345,11 @@ module.exports = function createPlus(ctx) {
     }
     if (mode !== 'text') {
       try {
-        await sendVoice(jid, reply, m);
-        if (mode === 'voice') return;
+        const vr = await sendVoice(jid, reply, m);
+        if (mode === 'voice') {
+          if (vr.rest) noteSent(await s.sendMessage(jid, { text: vr.rest })); // jo voice me nahi aaya wo text me
+          return;
+        }
       } catch (e) {
         log('voice fail, text bhej raha hoon:', e.message);
       }
@@ -286,7 +360,8 @@ module.exports = function createPlus(ctx) {
   async function deliver(jid, text, voice) {
     if (voice) {
       try {
-        await sendVoice(jid, text);
+        const vr = await sendVoice(jid, text);
+        if (vr.rest) noteSent(await S().sendMessage(jid, { text: vr.rest }));
         return;
       } catch (e) {
         log('scheduled voice fail -> text:', e.message);
@@ -356,7 +431,7 @@ module.exports = function createPlus(ctx) {
     c === 0 ? 'Saaf aasmaan ☀️' : c <= 3 ? 'Halke baadal ⛅' : c <= 48 ? 'Kohra 🌫' : c <= 57 ? 'Boondabandi 🌦' : c <= 67 ? 'Baarish 🌧' : c <= 77 ? 'Barfbaari ❄️' : c <= 82 ? 'Zordar baarish 🌧' : 'Toofan ⛈';
 
   async function weatherAt(lat, lon, label) {
-    const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=1`);
+    const r = await fetchT(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=1`, {}, 15000);
     const d = await r.json();
     const c = d.current;
     const dl = d.daily;
@@ -364,17 +439,73 @@ module.exports = function createPlus(ctx) {
     return `🌤 ${label}\n${wmo(c.weather_code)} ${c.temperature_2m}°C (mehsoos: ${c.apparent_temperature}°C)\nNami: ${c.relative_humidity_2m}% | Hawa: ${c.wind_speed_10m} km/h\nAaj: ${dl.temperature_2m_min[0]}° se ${dl.temperature_2m_max[0]}°C, baarish ki sambhavna ${dl.precipitation_probability_max[0]}%`;
   }
   async function weatherCity(name) {
-    const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=en`);
+    const r = await fetchT(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=en`, {}, 15000);
     const g = (await r.json())?.results?.[0];
     if (!g) return `"${name}" shehar nahi mila.`;
     return weatherAt(g.latitude, g.longitude, `${g.name}${g.country ? ', ' + g.country : ''}`);
   }
 
+  // Function()/eval ke bina chhota safe parser: + - * / % ^ ( ) aur decimal
   function calc(expr) {
-    const e = String(expr).replace(/\^/g, '**').replace(/,/g, '');
-    if (!e || e.length > 80 || !/^[\d\s+\-*/().%]+$/.test(e)) return null;
+    const s = String(expr).replace(/,/g, '').replace(/\s+/g, '').replace(/\*\*/g, '^');
+    if (!s || s.length > 80 || !/^[\d+\-*/().%^]+$/.test(s)) return null;
+    let i = 0;
+    const fail = () => {
+      throw new Error('bad');
+    };
+    function atom() {
+      if (s[i] === '(') {
+        i++;
+        const v = add();
+        if (s[i] !== ')') fail();
+        i++;
+        return v;
+      }
+      const m = s.slice(i).match(/^(\d+\.?\d*|\.\d+)/);
+      if (!m) fail();
+      i += m[0].length;
+      return parseFloat(m[0]);
+    }
+    function unary() {
+      if (s[i] === '-') {
+        i++;
+        return -unary();
+      }
+      if (s[i] === '+') {
+        i++;
+        return unary();
+      }
+      return power();
+    }
+    function power() {
+      const b = atom();
+      if (s[i] === '^') {
+        i++;
+        return Math.pow(b, unary());
+      }
+      return b;
+    }
+    function mul() {
+      let v = unary();
+      while (s[i] === '*' || s[i] === '/' || s[i] === '%') {
+        const op = s[i++];
+        const r = unary();
+        v = op === '*' ? v * r : op === '/' ? v / r : v % r;
+      }
+      return v;
+    }
+    function add() {
+      let v = mul();
+      while (s[i] === '+' || s[i] === '-') {
+        const op = s[i++];
+        const r = mul();
+        v = op === '+' ? v + r : v - r;
+      }
+      return v;
+    }
     try {
-      const v = Function('"use strict";return (' + e + ')')();
+      const v = add();
+      if (i !== s.length) return null;
       return Number.isFinite(v) ? v : null;
     } catch (_) {
       return null;
@@ -385,15 +516,16 @@ module.exports = function createPlus(ctx) {
     ff(['-i', 'pipe:0', '-frames:v', '1', '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000', '-c:v', 'libwebp', '-lossless', '0', '-quality', '70', '-f', 'webp', 'pipe:1'], buf);
 
   async function imagine(prompt) {
-    const data = await gfetch(IMG_MODEL, { contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } });
+    const data = await gfetch(IMG_MODELS, { contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } });
     const part = (data?.candidates?.[0]?.content?.parts || []).find((p) => p.inlineData?.data);
     if (!part) throw new Error('Image nahi bani (model ya quota check karo)');
     return { mime: part.inlineData.mimeType || 'image/png', buf: Buffer.from(part.inlineData.data, 'base64') };
   }
 
+  // AI fail ho to null (error text kabhi asli jawab ban kar na jaye)
   const ask1 = async (prompt, system) => {
     const r = await callGemini([{ role: 'user', parts: [{ text: prompt }] }], system || 'Reply in the same language as the user. Be brief.');
-    return r.text;
+    return r.ok && r.text ? r.text : null;
   };
 
   function parseWhen(s) {
@@ -441,8 +573,19 @@ module.exports = function createPlus(ctx) {
   };
 
   // ---------------------------------------------------------------- CALLS
+  // Ek call = ek state machine = caller ko max EK message:
+  //   ringing -> approve   : call kat + voice note + voice chat          (state 'bot')
+  //           -> cancel(2) : bot hat gaya, call ringing chhodi            (state 'cancelled')
+  //           -> timeout   : call kat + AI maafi message                  (state 'missed')
+  //           -> aapne uthayi (accept event) : bot hat gaya, call ke baad AI shukriya (state 'answered')
+  //   callmode off : kuch nahi poochta; call khatam hone par AI shukriya / maafi (state 'plain')
   const GREET = () => settings.callGreet || env.CALL_GREETING || 'Namaste! Main abhi call par baat nahi kar sakta, lekin aap yahan voice note bhejiye ya likhiye. Main sunkar turant voice me jawab dunga.';
   const GREET_DND = 'Namaste! Abhi aaram ka samay hai, isliye call nahi uth sakti. Aap voice note ya message chhod dijiye, main sunkar jawab dunga aur unhe bata dunga.';
+  const callById = (id) => callLog.find((x) => x.id === id);
+  const dayPart = () => {
+    const h = ctx.nowParts().hh;
+    return h < 5 ? 'raat' : h < 12 ? 'subah' : h < 17 ? 'dopahar' : h < 21 ? 'shaam' : 'raat';
+  };
 
   function startSession(jid, num, why) {
     const se = { jid, num, ids: idsOf(jid).concat(num), started: Date.now(), until: Date.now() + SESSION_MIN * 60000, turns: 0, why };
@@ -457,19 +600,115 @@ module.exports = function createPlus(ctx) {
       if (!quiet && connected()) await sendVoice(se.jid, 'Baat karke achha laga. Aur kuch chahiye to kabhi bhi message ya voice note bhej dijiye. Dhanyavaad!').catch(() => {});
       if (se.turns > 0) {
         const h = (history.get(se.jid) || []).slice(-10).map((x) => `${x.role === 'user' ? 'User' : 'Bot'}: ${x.text}`).join('\n');
-        const sum = h ? await ask1('Is baatcheet ka 2-3 line Hinglish summary do (kya poocha, kya zaroori):\n' + h) : '';
-        await alertOwner(`🎙 Voice chat khatam: ${se.num} (${se.turns} jawab)\n${sum || ''}`);
+        const sum = h ? await ask1('Is baatcheet ka 2-3 line Hinglish summary do (kya poocha, kya zaroori):\n' + h) : null;
+        await alertOwner(`🎙 Voice chat khatam: ${se.num} (${se.turns} jawab)${sum ? '\n' + sum : ''}`); // summary fail ho to error text nahi jata
       }
     } catch (e) {
       log('endSession:', e.message);
     }
   }
 
+  // Call reject: alag-alag ID (from / chatId / phone) se try karta hai (Baileys 7 me LID aur phone alag ho sakte hain)
+  async function tryReject(entry) {
+    const s = S();
+    if (!s) return false;
+    const pn = entry.pn ? (String(entry.pn).includes('@') ? entry.pn : `${entry.pn}@s.whatsapp.net`) : null;
+    const cands = [...new Set([entry.from, entry.jid, pn].filter(Boolean))];
+    let anyOk = false;
+    let lastErr = '';
+    for (const who of cands) {
+      try {
+        await withTimeout(s.rejectCall(entry.id, who), 15000, 'rejectCall');
+        anyOk = true;
+        log(`rejectCall bheja (call ${entry.id}, ${who})`);
+        for (let i = 0; i < 6 && !entry.ended; i++) await sleep(500); // asar dikha? (terminate/reject event aana chahiye)
+        if (entry.ended) {
+          entry.rejected = true;
+          return true;
+        }
+        log(`rejectCall: ${who} se call band hone ka event nahi aaya, agli ID try`);
+      } catch (e) {
+        lastErr = e.message;
+        log('rejectCall fail:', who, e.message);
+      }
+    }
+    if (anyOk) {
+      entry.rejected = true; // bheja gaya, par confirm nahi hua
+      return true;
+    }
+    bump('rejectFail');
+    entry.rejectErr = lastErr;
+    return false;
+  }
+
+  // Call ke baad ka message (AI se). Fail ho to env / default text.
+  async function callMessage(entry, kind) {
+    if (!CALL_AI_MSG) return null;
+    const name = contacts[entry.num]?.name;
+    const earlier = callLog.filter((x) => x.num === entry.num && x.id !== entry.id && Date.now() - x.at < 3600000).length;
+    const lines = [
+      `Ek WhatsApp ${entry.video ? 'video ' : ''}call abhi ${kind === 'answered' ? 'uthayi gayi aur baat hui' : 'miss ho gayi (owner nahi utha paye)'}.`,
+      name ? `Caller ka naam: ${name}.` : '',
+      `Samay: ${dayPart()} (${hhmm(Date.now())}).`,
+      earlier ? `Is number se pichle 1 ghante me ${earlier} aur call aayi thi.` : '',
+      kind === 'answered'
+        ? 'Likho: baat karne ke liye chhota sa shukriya, aur kaho ki koi aur baat ho to yahan message kar sakte hain.'
+        : 'Likho: call na uth paane ki maafi, poochho ki kya baat ya samasya hai (text ya photo me bhej sakte hain), batao ki message note ho jayega aur jaldi jawab milega. Agar baat bahut urgent ho to dobara call kar sakte hain.',
+      'Sirf final WhatsApp message likho: 1-3 chhote vakya, natural bolchal ki Hinglish (caller jis bhasha me comfortable ho), zyada se zyada 1 emoji, har baar naye shabd. Koi label, quote ya explanation nahi.',
+      callMsgHist.length ? 'Pichle messages jaisa mat likho:\n' + callMsgHist.map((x) => '- ' + x).join('\n') : '',
+    ].filter(Boolean);
+    const r = await callGemini([{ role: 'user', parts: [{ text: lines.join('\n') }] }], ctx.getPrompt() + extraSystem(entry.jid));
+    if (!r.ok || !r.text) return null;
+    const t = r.text.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim();
+    if (!t || t.length > 600) return null;
+    callMsgHist.push(t.replace(/\s+/g, ' ').slice(0, 100));
+    while (callMsgHist.length > 6) callMsgHist.shift();
+    return t;
+  }
+
+  async function followUp(entry, kind) {
+    if (entry.followed) return; // ek call par ek hi message
+    entry.followed = true;
+    try {
+      if (!settings.callReply || !connected()) return;
+      if (!permitted(entry.num, entry.jid)) return;
+      if (Date.now() - (lastFollow.get(entry.num) || 0) < CALL_COOLDOWN_MS) {
+        log(`call msg skip (cooldown): ${entry.num}`);
+        return;
+      }
+      lastFollow.set(entry.num, Date.now());
+      let text = await callMessage(entry, kind).catch((e) => {
+        log('call msg AI error:', e.message);
+        return null;
+      });
+      const ai = !!text;
+      if (!text) text = kind === 'answered' ? FALLBACK_ANSWERED : FALLBACK_MISSED;
+      await sleep(1500 + Math.random() * 2500);
+      noteSent(await withTimeout(S().sendMessage(entry.jid, { text }), 30000, 'call msg'));
+      pushHistory(
+        entry.jid,
+        kind === 'answered'
+          ? '[System: is vyakti ne abhi call ki thi aur baat hui. Maine shukriya bola.]'
+          : '[System: is vyakti ne abhi call ki thi par call uthayi nahi gayi. Maine maafi mangi aur unki baat / samasya puchi. Ab unki baat dhyan se suno, madad karo, aur kaho ki unka message note kar liya gaya hai.]',
+        text
+      );
+      entry.result += kind === 'answered' ? ' + shukriya msg' : ' + maafi msg';
+      dirty.calls = true;
+      log(`call msg (${kind}, ${ai ? 'AI' : 'fixed'}) -> ${entry.num}`);
+      if (kind === 'missed') await alertOwner(`📞 Missed ${entry.video ? 'video ' : ''}call: ${entry.num}. Maine unhe message bhej diya (unki baat puchi).`);
+    } catch (e) {
+      log('followUp error:', e.message);
+    }
+  }
+
   async function autoAnswer(entry, why) {
     const s = S();
-    handled.add(entry.id);
-    if (REJECT_ON_APPROVE && !entry.ended) await s.rejectCall(entry.id, entry.from).catch((e) => log('rejectCall:', e.message));
-    entry.result = `bot ne baat ki (${why})`;
+    entry.state = 'bot';
+    if (REJECT_ON_APPROVE && !entry.ended) {
+      const ok = await tryReject(entry);
+      if (!ok) await alertOwner(`Call (${entry.num}) kat nahi paayi, ringing chalti reh sakti hai. Voice note phir bhi bhej raha hoon. Logs me "rejectCall" dekho.`);
+    }
+    entry.result = `bot ne baat ki (${why})${entry.rejected ? '' : ' - call kat nahi'}`;
     dirty.calls = true;
     startSession(entry.jid, entry.num, why);
     const g = why === 'DND time' ? GREET_DND : GREET();
@@ -486,14 +725,20 @@ module.exports = function createPlus(ctx) {
   async function onCallOffer(c) {
     const mode = settings.callMode || 'ask';
     bump('calls');
-    const entry = { id: c.id, num: c.num, jid: c.jid, from: c.from, video: c.video, at: Date.now(), result: 'ringing' };
+    const entry = { id: c.id, num: c.num, jid: c.jid, from: c.from, pn: c.pn, video: c.video, at: Date.now(), result: 'ringing', state: 'ringing' };
     callLog.push(entry);
     while (callLog.length > 50) callLog.shift();
     dirty.calls = true;
     const prev = recentCalls.get(c.num);
     recentCalls.set(c.num, { at: Date.now(), accepted: false });
-    if (mode === 'off' || !connected()) return (entry.result = 'plain');
-    if (!permitted(c.num, c.jid)) return (entry.result = 'blocked');
+    if (mode === 'off' || !connected()) {
+      entry.state = 'plain';
+      return (entry.result = mode === 'off' ? 'callmode off' : 'bot connected nahi tha');
+    }
+    if (!permitted(c.num, c.jid)) {
+      entry.state = 'blocked';
+      return (entry.result = 'blocked / allowed list me nahi');
+    }
     const repeat = prev && !prev.accepted && Date.now() - prev.at < REPEAT_MIN * 60000;
     const why = mode === 'auto' ? 'auto mode' : settings.callVip.includes(c.num) ? 'VIP' : repeat ? 'dobara call (repeat)' : inDnd() ? 'DND time' : null;
     if (why) {
@@ -501,11 +746,17 @@ module.exports = function createPlus(ctx) {
       return autoAnswer(entry, why);
     }
     const id = 'C' + ++seq;
-    const p = { id, entry, timer: setTimeout(() => resolveCall(id, APPROVAL_DEFAULT === 'auto' ? 'approve' : 'timeout').catch(() => {}), APPROVAL_SEC * 1000) };
+    const autoOnTimeout = APPROVAL_DEFAULT === 'auto';
+    const p = { id, entry, at: Date.now(), timer: setTimeout(() => resolveCall(id, autoOnTimeout ? 'approve' : 'timeout').catch((e) => log('resolveCall:', e.message)), APPROVAL_SEC * 1000) };
     pending.set(id, p);
-    await alertOwner(
-      `📞 ${entry.video ? 'Video call' : 'Call'} aa rahi hai: ${entry.num}\n\n1️⃣ *1* = ✅ Approve (main call band karke voice me baat karunga)\n2️⃣ *2* = ❌ Cancel (main hat jaunga)\n\n${APPROVAL_SEC}s me jawab do (ID ${id})`
+    const who = contacts[c.num]?.name ? `${c.num} (${contacts[c.num].name})` : c.num;
+    const reached = await alertOwner(
+      `📞 ${entry.video ? 'Video call' : 'Call'} aa rahi hai: ${who}\n\n*1* = ✅ Approve (call kat kar voice note se baat karunga)\n*2* = ❌ Cancel (main kuch nahi karunga, call ringing chhod dunga)\n\n${APPROVAL_SEC}s me kuch na bola to ${autoOnTimeout ? 'main khud voice me baat kar lunga' : 'call kat dunga aur maafi ka message bhej dunga'}. Aap khud utha lo to main hat jaunga. (ID ${id})`
     );
+    if (!reached) {
+      log(`call ${id}: owner tak prompt nahi pahuncha, default action turant`);
+      await resolveCall(id, autoOnTimeout ? 'approve' : 'timeout');
+    }
   }
 
   async function resolveCall(id, action) {
@@ -513,50 +764,98 @@ module.exports = function createPlus(ctx) {
     if (!p) return false;
     clearTimeout(p.timer);
     pending.delete(id);
+    const e = p.entry;
     if (action === 'approve') {
       bump('approved');
-      await autoAnswer(p.entry, 'approve');
+      await autoAnswer(e, 'approve');
     } else if (action === 'cancel') {
       bump('cancelled');
-      handled.add(p.entry.id);
-      p.entry.result = 'cancel (owner ne mana kiya)';
+      e.state = 'cancelled';
+      e.result = 'cancel (owner ne mana kiya)';
+      if (CANCEL_REJECT && !e.ended) {
+        const ok = await tryReject(e);
+        e.result += ok ? ' + call kati' : ' + call kaatna fail';
+      }
     } else {
-      p.entry.result = 'approval timeout';
+      // jawab nahi aaya: call kato + maafi
+      bump('missed');
+      e.state = 'missed';
+      e.result = 'approval timeout';
+      if (REJECT_ON_TIMEOUT && !e.ended) {
+        const ok = await tryReject(e);
+        e.result += ok ? ' -> call kati' : ' -> call kaatna fail';
+        if (!ok) await alertOwner(`Call (${e.num}) kat nahi paayi (rejectCall fail). Logs me "rejectCall" line dekho.`);
+      }
+      await followUp(e, 'missed');
     }
     dirty.calls = true;
     return true;
   }
 
+  // aapne (ya kisi device ne) call utha li
   function onCallAccepted(id) {
-    const e = callLog.find((x) => x.id === id);
-    if (e) {
-      recentCalls.set(e.num, { at: Date.now(), accepted: true });
+    const e = callById(id);
+    if (!e) return;
+    recentCalls.set(e.num, { at: Date.now(), accepted: true });
+    e.accepted = true;
+    if (e.state === 'ringing' || e.state === 'plain') {
+      for (const [pid, p] of pending) {
+        if (p.entry === e) {
+          clearTimeout(p.timer);
+          pending.delete(pid);
+        }
+      }
+      e.state = 'answered';
       e.result = 'aapne uthayi';
+      dirty.calls = true;
     }
   }
-  function onCallEnd(id, accepted) {
-    const e = callLog.find((x) => x.id === id);
+
+  async function onCallEnd(id, status) {
+    const e = callById(id);
     if (!e) return;
     e.ended = true;
-    if (e.result === 'ringing') e.result = accepted ? 'uthayi gayi' : 'miss ho gayi';
     dirty.calls = true;
+    if (e.state === 'answered') {
+      e.result = 'baat hui';
+      return followUp(e, 'answered');
+    }
+    if (e.state === 'plain') {
+      e.result = status === 'reject' ? 'cut / reject ki gayi' : 'miss ho gayi';
+      return followUp(e, 'missed');
+    }
+    if (e.state === 'ringing') e.result = 'caller ne kaat di (approval ka intezaar)'; // timer / owner ka jawab baaki hai
   }
 
   // ---------------------------------------------------------------- PRE-HOOK (har message par)
-  async function pre({ m, s, jid, num, text, selfChat, fromOwner }) {
+  async function pre({ m, s, jid, num, isPn, text, selfChat, fromOwner }) {
     const isOwnerMsg = selfChat || fromOwner;
-    if (isOwnerMsg && pending.size && /^(1|2|yes|no|y|n|ok|haan|ha|nahi|nhi|approve|cancel|reject|✅|❌|1️⃣|2️⃣)$/i.test(text)) {
-      const id = [...pending.keys()].pop();
-      const yes = /^(1|yes|y|ok|haan|ha|approve|✅|1️⃣)$/i.test(text);
-      const late = pending.get(id)?.entry.ended;
-      await resolveCall(id, yes ? 'approve' : 'cancel');
-      noteSent(await s.sendMessage(jid, { text: yes ? `🤖 ✅ Approve ho gaya${late ? ' (call khatam ho chuki thi, par voice chat shuru kar di)' : ''}.` : '🤖 ❌ Cancel, main hat gaya.' }));
-      return true;
+    // Approval jawab: sirf poora "1" / "2" (ya ✅ / ❌) aur sirf jab call pending ho. Normal baat se galti se trigger nahi hota.
+    if (isOwnerMsg && pending.size) {
+      const t = String(text || '').trim();
+      const yes = /^(1|✅|1️⃣)$/.test(t);
+      const no = /^(2|❌|2️⃣)$/.test(t);
+      if (yes || no) {
+        if (pending.size > 1) {
+          const ids = [...pending.values()].map((p) => `${p.id} (${p.entry.num})`).join(', ');
+          noteSent(await s.sendMessage(jid, { text: `🤖 Ek se zyada calls pending hain: ${ids}\nKaunsi? Likho: !approve <ID> ya !cancel <ID>` }));
+          return true;
+        }
+        const p = [...pending.values()][0];
+        const late = p.entry.ended;
+        await resolveCall(p.id, yes ? 'approve' : 'cancel');
+        noteSent(
+          await s.sendMessage(jid, {
+            text: yes ? `🤖 ✅ Approve ho gaya${late ? ' (call khatam ho chuki thi, par voice chat shuru kar di)' : ''}.` : `🤖 ❌ Cancel. Main kuch nahi karunga${CANCEL_REJECT ? ' (call kat di)' : ' (call ringing chhodi hai, aap utha sakte ho)'}.`,
+          })
+        );
+        return true;
+      }
     }
     if (m.key.fromMe || isOwnerMsg || String(jid).endsWith('@g.us')) return false;
     const until = tempBlocked.get(num);
     if (until && until > Date.now()) return true;
-    contact(num, jid, m.pushName);
+    contact(num, jid, m.pushName, isPn);
     bump('msgs');
     const now = Date.now();
     const arr = (floodMap.get(num) || []).filter((t) => now - t < 60000);
@@ -614,7 +913,7 @@ module.exports = function createPlus(ctx) {
       case 'tr': {
         const mm = arg.match(/^([^|]+)\|([\s\S]+)$/) || arg.match(/^(\S+)\s+([\s\S]+)$/);
         if (!mm) return 'Use: !tr hindi | Hello how are you';
-        return (await ask1(`Translate to ${mm[1].trim()}. Output only the translation:\n${mm[2].trim()}`, 'You are a precise translator.')) || 'Translate nahi ho paya.';
+        return (await ask1(`Translate to ${mm[1].trim()}. Output only the translation:\n${mm[2].trim()}`, 'You are a precise translator.')) || 'Translate nahi ho paya, thodi der baad try karo.';
       }
       case 'weather':
         return arg ? weatherCity(arg) : 'Use: !weather Delhi (ya apni location bhejo)';
@@ -623,7 +922,7 @@ module.exports = function createPlus(ctx) {
         return v === null ? 'Use: !calc 25*4+10 (sirf + - * / % ( ) )' : `${arg} = ${v}`;
       }
       case 'joke':
-        return (await ask1('Ek chhota, saaf-suthra mazedaar joke Hinglish me sunao.')) || 'Abhi joke nahi mil raha 😅';
+        return (await ask1('Ek chhota, saaf-suthra mazedaar joke Hinglish me sunao.')) || 'Abhi joke nahi mil raha 😅 (thodi der baad try karo)';
       case 'sticker': {
         const im = pickImageMsg(m, jid);
         if (!im) return 'Photo bhejo caption "!sticker" ke saath (ya kisi photo ko reply karke !sticker likho).';
@@ -639,7 +938,7 @@ module.exports = function createPlus(ctx) {
         if (!buf) return 'Photo khul nahi payi.';
         const mime = content(im).imageMessage?.mimetype || 'image/jpeg';
         const r = await callGemini([{ role: 'user', parts: [{ inlineData: { mimeType: mime, data: buf.toString('base64') } }, { text: 'Is photo me jo bhi text hai use as-it-is nikaal kar likho. Text na ho to batao.' }] }], 'You are an OCR tool.');
-        return r.text;
+        return r.ok && r.text ? r.text : 'OCR nahi ho paya, thodi der baad try karo.';
       }
     }
     return undefined;
@@ -741,14 +1040,15 @@ Call aane par: 1 = approve, 2 = cancel
 
       // ---- calls
       case 'callmode':
-        if (!/^(ask|auto|off)$/i.test(arg)) return `Use: !callmode ask|auto|off\nAbhi: ${settings.callMode || 'ask'}\nask = approve poochega, auto = khud uthayega, off = sirf purana message`;
+        if (!/^(ask|auto|off)$/i.test(arg)) return `Use: !callmode ask|auto|off\nAbhi: ${settings.callMode || 'ask'}\nask = approve poochega, auto = khud voice me baat, off = kuch nahi poochega (sirf call ke baad AI message)`;
         settings.callMode = arg.toLowerCase();
         saveSettings();
         return `Call mode: ${settings.callMode} ✅`;
       case 'approve':
       case 'cancel': {
-        const id = arg || [...pending.keys()].pop();
-        if (!id || !(await resolveCall(id, cmd))) return 'Koi pending call nahi.';
+        if (!arg && pending.size > 1) return `Ek se zyada calls pending: ${[...pending.keys()].join(', ')}\nLikho: !${cmd} <ID>`;
+        const id = (arg || [...pending.keys()][0] || '').toUpperCase();
+        if (!id || !(await resolveCall(id, cmd))) return 'Koi pending call nahi (ya ID galat / time khatam).';
         return cmd === 'approve' ? '✅ Approve ho gaya.' : '❌ Cancel ho gaya.';
       }
       case 'callvip': {
@@ -818,12 +1118,19 @@ Call aane par: 1 = approve, 2 = cancel
         const n = arg.replace(/\D/g, '');
         const key = n ? [...history.keys()].find((k) => k.includes(n)) : jid;
         const h = (history.get(key) || []).map((x) => `${x.role === 'user' ? 'User' : 'Bot'}: ${x.text}`).join('\n');
-        return h ? ask1('Is chat ka Hinglish me short summary do:\n' + h) : 'Is chat ki history nahi mili.';
+        return h ? (await ask1('Is chat ka Hinglish me short summary do:\n' + h)) || 'Summary nahi ban paya, thodi der baad try karo.' : 'Is chat ki history nahi mili.';
       }
       case 'imagine': {
         if (!arg) return 'Use: !imagine ek ladka cricket khelta hua, cartoon style';
         const im = await imagine(arg);
-        noteSent(await s.sendMessage(jid, { image: im.buf, caption: '🎨 ' + arg.slice(0, 100) }));
+        // Baileys ko thumbnail ke liye sharp/jimp chahiye hota hai; hum ffmpeg se khud bana kar dete hain
+        let thumb;
+        try {
+          thumb = await ff(['-i', 'pipe:0', '-frames:v', '1', '-vf', 'scale=100:-2', '-q:v', '8', '-f', 'mjpeg', 'pipe:1'], im.buf);
+        } catch (e) {
+          log('thumb fail:', e.message);
+        }
+        noteSent(await s.sendMessage(jid, { image: im.buf, caption: '🎨 ' + arg.slice(0, 100), ...(thumb ? { jpegThumbnail: thumb } : {}) }));
         return null;
       }
 
@@ -865,7 +1172,7 @@ Call aane par: 1 = approve, 2 = cancel
       case 'bc': {
         const mm = arg.match(/^([^|]+)\|([\s\S]+)$/);
         if (!mm) return 'Use: !bc 9198..,9199.. | message   ya   !bc all | message';
-        let list = /^all$/i.test(mm[1].trim()) ? Object.keys(contacts).filter((k) => /^\d{8,15}$/.test(k)) : numList(mm[1]);
+        let list = /^all$/i.test(mm[1].trim()) ? Object.keys(contacts).filter((k) => /^\d{8,15}$/.test(k) && contacts[k].pn === true) : numList(mm[1]); // LID wale (phone number pata nahi) skip
         list = [...new Set(list)].filter((n) => !ctx.getBlocked().includes(n)).slice(0, BC_MAX);
         if (!list.length) return 'Koi number nahi mila.';
         (async () => {
@@ -888,7 +1195,7 @@ Call aane par: 1 = approve, 2 = cancel
   function statsText() {
     const d = today();
     const x = stats.date === d ? stats : {};
-    return `📊 Aaj (${d})\nMessages: ${x.msgs || 0}\nVoice aaye: ${x.voiceIn || 0} | Voice bheje: ${x.voiceOut || 0}\nCalls: ${x.calls || 0} | Approve: ${x.approved || 0} | Cancel: ${x.cancelled || 0} | Auto: ${x.auto || 0}\nVoice chats: ${x.sessions || 0}`;
+    return `📊 Aaj (${d})\nMessages: ${x.msgs || 0}\nVoice aaye: ${x.voiceIn || 0} | Voice bheje: ${x.voiceOut || 0}\nCalls: ${x.calls || 0} | Approve: ${x.approved || 0} | Cancel: ${x.cancelled || 0} | Auto: ${x.auto || 0} | Timeout/miss: ${x.missed || 0} | Reject fail: ${x.rejectFail || 0}\nVoice chats: ${x.sessions || 0}`;
   }
 
   // ---------------------------------------------------------------- BACKGROUND TICK
@@ -901,7 +1208,16 @@ Call aane par: 1 = approve, 2 = cancel
         if (due.length) {
           settings.reminders = settings.reminders.filter((r) => r.at > now);
           saveSettings();
-          for (const r of due) noteSent(await S().sendMessage(r.jid || ownerJid(), { text: `⏰ Reminder: ${r.text}` }));
+          for (const r of due) {
+            const late = now - r.at > 120000 ? ' (der se, bot band tha)' : '';
+            try {
+              noteSent(await withTimeout(S().sendMessage(r.jid || ownerJid(), { text: `⏰ Reminder${late}: ${r.text}` }), 30000, 'reminder'));
+            } catch (e) {
+              log('reminder fail:', e.message);
+              settings.reminders.push({ ...r, at: now + 60000 }); // 1 min baad dobara
+              saveSettings();
+            }
+          }
         }
         if (settings.report) {
           const n = ctx.nowParts();
@@ -913,21 +1229,33 @@ Call aane par: 1 = approve, 2 = cancel
           }
         }
       }
+      // memory safai
       for (const [k, v] of tempBlocked) if (v < now) tempBlocked.delete(k);
+      for (const [k, v] of floodMap) if (!v.some((t) => now - t < 60000)) floodMap.delete(k);
+      for (const [k, v] of recentCalls) if (now - v.at > 3600000) recentCalls.delete(k);
+      for (const [k, v] of lastFollow) if (now - v > 3600000) lastFollow.delete(k);
       flush();
     } catch (e) {
       log('plus tick:', e.message);
     }
   }
-  function flush() {
+  // force=true: band hote waqt turant sab likho
+  function flush(force) {
     if (dirty.stats) writeJson(STATS_FILE, stats);
     if (dirty.contacts) writeJson(CONTACTS_FILE, contacts);
     if (dirty.calls) writeJson(CALLLOG_FILE, callLog);
     dirty = { stats: false, contacts: false, calls: false };
-    const h = JSON.stringify(Object.fromEntries(history));
+    // history: har 60 sec me (ya band hote waqt) sirf badli ho to; purani chats chhodi jati hain
+    if (!ctx.HISTORY_SAVE) return;
+    if (!force && Date.now() - lastHistWrite < 60000) return;
+    lastHistWrite = Date.now();
+    const keep = Date.now() - ctx.HISTORY_KEEP_HOURS * 3600000;
+    const out = {};
+    for (const [k, v] of history) if ((histAt.get(k) || Date.now()) >= keep) out[k] = v;
+    const h = JSON.stringify(out);
     if (h !== lastHist) {
       lastHist = h;
-      writeJson(HIST_FILE, Object.fromEntries(history));
+      writeJson(HIST_FILE, out);
     }
   }
   setInterval(tickPlus, 15000);
@@ -938,11 +1266,11 @@ Call aane par: 1 = approve, 2 = cancel
       const say = String(req.query.say || '').slice(0, 400);
       const voice = VOICES.includes(req.query.voice) ? req.query.voice : voiceName();
       const pend = [...pending.values()].map((p) => `<div class="sch"><b>${p.entry.video ? '📹' : '📞'} ${esc(p.entry.num)}</b>
-        <div class="row" style="margin-top:8px"><form method="POST" action="/plus/approve/${p.id}"><button class="sm">✅ Approve</button></form>
-        <form method="POST" action="/plus/cancel/${p.id}"><button class="sm red">❌ Cancel</button></form></div></div>`).join('') || '<p class="muted">Koi call approval pending nahi.</p>';
-      const sess = [...new Set(sessions.values())].map((x) => `<div class="row sch"><span>🎙 ${esc(x.num)} · ${x.turns} jawab</span><form method="POST" action="/plus/end/${esc(x.num)}"><button class="sm gray">Band</button></form></div>`).join('') || '<p class="muted">Koi voice chat nahi.</p>';
+        <div class="row" style="margin-top:8px"><form method="POST" action="/plus/approve/${p.id}">${CSRF}<button class="sm">✅ Approve</button></form>
+        <form method="POST" action="/plus/cancel/${p.id}">${CSRF}<button class="sm red">❌ Cancel</button></form></div></div>`).join('') || '<p class="muted">Koi call approval pending nahi.</p>';
+      const sess = [...new Set(sessions.values())].map((x) => `<div class="row sch"><span>🎙 ${esc(x.num)} · ${x.turns} jawab</span><form method="POST" action="/plus/end/${esc(x.num)}">${CSRF}<button class="sm gray">Band</button></form></div>`).join('') || '<p class="muted">Koi voice chat nahi.</p>';
       const calls = callLog.slice(-8).reverse().map((e) => `<div class="sch"><small>${hhmm(e.at)}</small> ${e.video ? '📹' : '📞'} ${esc(e.num)}<br><small>${esc(e.result)}</small></div>`).join('') || '<p class="muted">Khali.</p>';
-      const inbox = voiceInbox.slice(-8).reverse().map((v) => `<div class="sch"><small>${v.dir === 'in' ? '⬇️ aaya' : '⬆️ gaya'} · ${esc(v.num)} · ${hhmm(v.at)}</small>${v.text ? `<br><small>${esc(v.text.slice(0, 80))}</small>` : ''}<br><audio controls preload="none" style="width:100%" src="/plus/audio/${v.id}"></audio></div>`).join('') || '<p class="muted">Abhi koi voice nahi.</p>';
+      const inbox = !VOICE_INBOX ? '<p class="muted">Voice inbox band hai (privacy). Chalu karne ke liye <b>VOICE_INBOX=true</b> variable daalo.</p>' : voiceInbox.slice(-8).reverse().map((v) => `<div class="sch"><small>${v.dir === 'in' ? '⬇️ aaya' : '⬆️ gaya'} · ${esc(v.num)} · ${hhmm(v.at)}</small>${v.text ? `<br><small>${esc(v.text.slice(0, 80))}</small>` : ''}<br><audio controls preload="none" style="width:100%" src="/plus/audio/${v.id}"></audio></div>`).join('') || '<p class="muted">Abhi koi voice nahi.</p>';
       const opts = VOICES.map((v) => `<option${v === voice ? ' selected' : ''}>${v}</option>`).join('');
       const body = `<div class="card"><h2>🎙 Voice & Calls</h2><p class="muted">Call mode: <b>${esc(settings.callMode || 'ask')}</b> · Reply mode: <b>${esc(settings.mode || env.REPLY_MODE || 'text')}</b> · Awaaz: <b>${esc(voiceName())}</b></p><a href="/"><button class="gray">⬅️ Home</button></a></div>
       <div class="card"><h3>📞 Call approval</h3>${pend}</div>
@@ -977,11 +1305,12 @@ Call aane par: 1 = approve, 2 = cancel
       }
     });
     app.get('/plus/audio/:id', auth, (req, res) => {
+      if (!VOICE_INBOX) return res.status(404).send('voice inbox band hai');
       const v = voiceInbox.find((x) => x.id === parseInt(req.params.id, 10));
       if (!v) return res.status(404).send('nahi mila');
       res.type('audio/ogg').send(v.buf);
     });
   }
 
-  return { pre, wants, handle, sendReply, extraSystem, deliver, command, onCallOffer, onCallAccepted, onCallEnd, callHandled: (id) => handled.has(id), routes, _t: { wav, calc, parseWhen, speakable, inDnd } };
+  return { pre, wants, handle, sendReply, extraSystem, deliver, command, onCallOffer, onCallAccepted, onCallEnd, flush, routes, _t: { wav, calc, parseWhen, speakable, inDnd, splitForVoice, _calls: { pending, callLog, recentCalls } } };
 };
