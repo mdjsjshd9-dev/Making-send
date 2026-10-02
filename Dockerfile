@@ -1,8 +1,8 @@
 FROM node:20-slim
 
-# git zaroori hai: Baileys ki ek dependency (libsignal) GitHub se aati hai
+# git: Baileys ki dependency (libsignal) GitHub se aati hai | ffmpeg: voice note / sticker banane ke liye
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 # ssh ki jagah https se GitHub dependencies download ho
